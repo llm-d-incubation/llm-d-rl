@@ -29,24 +29,39 @@ This positions vLLM+llm-d as the natural entry point for any lab doing RL post-t
 
 To define the scope of the RL rollout infrastructure, we use the example of a typical RL training step (e.g., GRPO/PPO) to illustrate where llm-d intervenes:
 
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                        RL Training Loop                                │
-│  (veRL, Slime, SkyRL, OpenRLHF, NeMo-RL, or custom)                  │
-│                                                                        │
-│  1. Prepare prompt batch from dataset                                  │
-│  2. ── REQUEST GENERATION ──────────────────────────────────────┐     │
-│  3.    llm-d routes requests across vLLM engine pool            │     │
-│  4.    llm-d returns generated sequences + logprobs             │     │
-│  5. ◄───────────────────────────────────────────────────────────┘     │
-│  6. Compute rewards (reward model or function)                         │
-│  7. Compute advantages, train policy (gradient update)                 │
-│  8. ── PUSH UPDATED WEIGHTS ────────────────────────────────────┐     │
-│  9.    llm-d coordinates pause → weight transfer → resume       │     │
-│ 10.    Engines receive new weights via NCCL/NIXL                │     │
-│ 11. ◄───────────────────────────────────────────────────────────┘     │
-│ 12. Repeat from step 1                                                 │
-└────────────────────────────────────────────────────────────────────────┘
+```mermaid
+sequenceDiagram
+    box rgb(240,240,255) RL Training Loop (veRL / Slime / SkyRL / OpenRLHF / NeMo-RL)
+        participant TL as Training Loop
+    end
+    box rgb(220,245,220) llm-d Rollout Infrastructure (in scope)
+        participant RC as Rollout Controller
+        participant EP as Engine Pool (vLLM)
+    end
+
+    Note over TL: 1. Prepare prompt batch from dataset
+
+    rect rgb(200,230,255)
+        Note right of TL: GENERATION (in scope)
+        TL->>RC: 2. Generate(prompts, sampling_params)
+        RC->>EP: 3. Route via EPP (KV-cache aware)
+        EP-->>RC: 4. Generated sequences + logprobs
+        RC-->>TL: 5. Return rollout results
+    end
+
+    Note over TL: 6. Compute rewards (reward model or function)
+    Note over TL: 7. Compute advantages, train policy (gradient update)
+
+    rect rgb(200,230,255)
+        Note right of TL: WEIGHT SYNC (in scope)
+        TL->>RC: 8. UpdateWeights(target_version)
+        RC->>EP: 9. Pause → transfer → resume
+        Note over TL,EP: 10. Weights sent via NCCL/NIXL (GPU-to-GPU)
+        EP-->>RC: 11. Engines updated, KV cache reset
+        RC-->>TL: Weight sync complete
+    end
+
+    Note over TL: 12. Repeat from step 1
 ```
 
 **In scope (bordered in blue):** Steps 2–4 (generation dispatch and routing) and steps 8–11 (weight synchronization lifecycle). These are the **rollout infrastructure primitives** — the components llm-d provides as a managed service.
@@ -108,6 +123,22 @@ vLLM already has native support for both via the `WeightTransferEngine` abstract
 
 **What llm-d provides:**
 
+```mermaid
+flowchart LR
+    A["Pause<br/>Generation"] --> B["Init Transfer<br/>Group"]
+    B --> C["Broadcast<br/>Weights"]
+    C --> D["Reset<br/>KV Cache"]
+    D --> E["Resume<br/>Generation"]
+    E --> F["Update Weight<br/>Version"]
+
+    style A fill:#ffeaea,stroke:#cc6666
+    style B fill:#fff3e0,stroke:#cc9944
+    style C fill:#e8f4e8,stroke:#66aa66
+    style D fill:#fff3e0,stroke:#cc9944
+    style E fill:#e8f0ff,stroke:#6688cc
+    style F fill:#f0f0ff,stroke:#8888cc
+```
+
 - A **weight sync controller** that orchestrates the full lifecycle: pause generation → establish transfer group → transfer weights → reset KV cache → resume generation
 - Support for multiple transport backends: **NCCL** (default), **NIXL/RDMA** (high-performance cross-node), and **checkpoint path** (load from shared storage)
 - **Packed tensor transfer** with double-buffering for bandwidth efficiency (matching vLLM's 1GB buffer pipeline)
@@ -124,8 +155,61 @@ vLLM already has native support for both via the `WeightTransferEngine` abstract
 
 - **Kubernetes-native pod lifecycle** — liveness probes, readiness gates, automatic pod replacement
 - An **engine pool controller** that maintains N healthy engines, replacing failed ones and reconnecting weight sync groups
-- **Sleep/wake orchestration** for colocated deployments: sleep(level=2) → training → wake_up(["weights"]) → weight sync → wake_up(["kv_cache"]) → generate
-- **Mode transitions** exposed via CRD status: `Serving` ↔ `Rolling` ↔ `Sleeping` ↔ `Syncing`
+- **Sleep/wake orchestration** for colocated deployments, as shown below
+- **Mode transitions** exposed via CRD status:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Serving : engines ready
+
+    Serving --> Syncing : UpdateWeights()
+    Syncing --> Serving : weight sync complete
+
+    Serving --> Sleeping : Sleep(level)
+    Sleeping --> Serving : WakeUp(tags)
+
+    Sleeping --> Syncing : WakeUp(["weights"]) + UpdateWeights()
+    Syncing --> Sleeping : sync done, KV cache not yet restored
+
+    Serving --> Rolling : engine failure detected
+    Rolling --> Serving : replacement engine ready
+```
+
+The colocated sleep/wake lifecycle for a single RL training step:
+
+```mermaid
+sequenceDiagram
+    participant TL as Training Loop
+    participant RC as Rollout Controller
+    participant EP as vLLM Engine
+
+    Note over EP: Phase: Serving (generating rollouts)
+
+    TL->>RC: Generate(prompts)
+    RC->>EP: dispatch requests
+    EP-->>RC: generated sequences
+    RC-->>TL: rollout results
+
+    TL->>RC: Sleep(level=2)
+    RC->>EP: sleep(level=2)
+    Note over EP: GPU memory freed<br/>(weights + KV cache discarded)
+
+    Note over TL: Training step<br/>(uses full GPU memory)
+
+    TL->>RC: WakeUp(["weights"])
+    RC->>EP: wake_up(tags=["weights"])
+    Note over EP: Weight memory restored
+
+    TL->>RC: UpdateWeights(v2)
+    RC->>EP: pause → receive weights → resume
+    Note over EP: New weights loaded via NCCL/NIXL
+
+    TL->>RC: WakeUp(["kv_cache"])
+    RC->>EP: wake_up(tags=["kv_cache"])
+    Note over EP: KV cache allocated,<br/>prefix cache reset
+
+    Note over EP: Phase: Serving (ready for next rollout)
+```
 
 ### Primitive 3: Load-Aware Routing
 
@@ -174,46 +258,71 @@ vLLM already has native support for both via the `WeightTransferEngine` abstract
 
 The key architectural decision is how RL training loops (running in Ray) communicate with llm-d (running on Kubernetes). We propose a **hybrid approach**:
 
+```mermaid
+graph TB
+    subgraph RAY["Ray Training Cluster"]
+        TL["Training Loop<br/>(any RL framework)"]
+    end
+
+    subgraph K8S["Kubernetes"]
+        subgraph RC["llm-d Rollout Controller"]
+            WS["Weight Sync<br/>Coordinator"]
+            PM["Engine Pool<br/>Manager"]
+            GS["Generation<br/>Service"]
+        end
+
+        subgraph EPP["Inference Scheduler (EPP)<br/>+ KV-Cache Indexer<br/>+ Workload Variant Autoscaler"]
+        end
+
+        subgraph POOL["vLLM Engine Pool (K8s Pods via LWS)"]
+            E0["Engine 0"]
+            E1["Engine 1"]
+            E2["Engine 2"]
+            EN["Engine N"]
+        end
+    end
+
+    TL -- "HTTP/gRPC<br/>control plane" --> RC
+    TL -. "NCCL/NIXL<br/>weight data plane<br/>(GPU-to-GPU)" .-> POOL
+    RC --> EPP
+    EPP --> POOL
+
+    style RAY fill:#f0f0ff,stroke:#8888cc,stroke-width:2px
+    style K8S fill:#f0fff0,stroke:#88cc88,stroke-width:2px
+    style RC fill:#e8f4e8,stroke:#66aa66
+    style EPP fill:#e8f0ff,stroke:#6688cc
+    style POOL fill:#fff8e8,stroke:#ccaa44
+    style TL fill:#dde,stroke:#88c
 ```
-┌──────────────────────────────────────────────────────────┐
-│  Ray Training Cluster                                     │
-│                                                           │
-│  ┌──────────────┐                                        │
-│  │ Training Loop │                                        │
-│  │ (any framework)                                       │
-│  └──────┬───────┘                                        │
-│         │                                                 │
-│    NCCL/NIXL ◄──── weight data plane (GPU-to-GPU) ────┐  │
-│         │                                              │  │
-└─────────┼──────────────────────────────────────────────┼──┘
-          │                                              │
-          │    HTTP/gRPC ◄── control plane ──┐           │
-          │                                  │           │
-┌─────────┼──────────────────────────────────┼───────────┼──┐
-│ Kubernetes                                 │           │  │
-│                                            │           │  │
-│  ┌─────────────────────────────────────────▼──────┐    │  │
-│  │  llm-d Rollout Controller                      │    │  │
-│  │                                                │    │  │
-│  │  ┌──────────────┐ ┌────────────┐ ┌───────────┐│    │  │
-│  │  │ Weight Sync  │ │ Engine Pool│ │ Generation ││    │  │
-│  │  │ Coordinator  │ │ Manager    │ │ Service    ││    │  │
-│  │  └──────────────┘ └────────────┘ └───────────┘│    │  │
-│  └────────────────────────┬───────────────────────┘    │  │
-│                           │                            │  │
-│  ┌────────────────────────▼───────────────────────┐    │  │
-│  │  Inference Scheduler (EPP)                     │    │  │
-│  │  + KV-Cache Indexer                            │    │  │
-│  │  + Workload Variant Autoscaler                 │    │  │
-│  └────────────────────────┬───────────────────────┘    │  │
-│                           │                            │  │
-│  ┌────────────────────────▼───────────────────────┐    │  │
-│  │  vLLM Engine Pool (K8s Pods via LWS)           │    │  │
-│  │  ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐  │◄───┘  │
-│  │  │Engine 0│ │Engine 1│ │Engine 2│ │Engine N│  │        │
-│  │  └────────┘ └────────┘ └────────┘ └────────┘  │        │
-│  └────────────────────────────────────────────────┘        │
-└────────────────────────────────────────────────────────────┘
+
+The **two communication paths** are intentionally separate:
+
+```mermaid
+graph LR
+    subgraph "Control Plane (HTTP/gRPC)"
+        A["Training Loop"] -->|"generate, pause,<br/>resume, update_weights,<br/>sleep, wake_up"| B["Rollout<br/>Controller"]
+        B -->|"route requests"| C["EPP"]
+        C -->|"dispatch"| D["vLLM Engines"]
+    end
+
+    style A fill:#f0f0ff,stroke:#8888cc
+    style B fill:#e8f4e8,stroke:#66aa66
+    style C fill:#e8f0ff,stroke:#6688cc
+    style D fill:#fff8e8,stroke:#ccaa44
+```
+
+```mermaid
+graph LR
+    subgraph "Data Plane (NCCL / NIXL)"
+        T["Trainer GPU<br/>(rank 0)"] -->|"NCCL broadcast<br/>or NIXL RDMA"| V0["vLLM Worker 0"]
+        T -->|"packed tensors<br/>(1GB buffers)"| V1["vLLM Worker 1"]
+        T -->|"direct GPU-to-GPU"| VN["vLLM Worker N"]
+    end
+
+    style T fill:#f0f0ff,stroke:#8888cc
+    style V0 fill:#fff8e8,stroke:#ccaa44
+    style V1 fill:#fff8e8,stroke:#ccaa44
+    style VN fill:#fff8e8,stroke:#ccaa44
 ```
 
 **Why this split:**

@@ -1,5 +1,46 @@
 # llm-d RL Rollout Infrastructure Roadmap
 
+## Overview
+
+```mermaid
+gantt
+    title llm-d RL Rollout Infrastructure Roadmap
+    dateFormat YYYY-MM-DD
+    axisFormat %b
+
+    section Phase 0 · Foundation
+        Project bootstrapping           :p0a, 2026-03-01, 1w
+        Rollout controller skeleton     :p0b, after p0a, 1w
+        Weight sync coordinator (NCCL)  :p0c, after p0a, 2w
+        Engine pool health monitoring   :p0d, after p0b, 1w
+        EPP integration                 :p0e, after p0b, 2w
+        End-to-end demo                 :milestone, p0m, after p0e, 0d
+
+    section Phase 1 · Production
+        NIXL/RDMA backend              :p1a, 2026-04-01, 2w
+        Packed tensor transfer          :p1b, after p1a, 1w
+        Sleep/wake orchestration        :p1c, 2026-04-01, 2w
+        Auto-recovery                   :p1d, after p1c, 2w
+        Session affinity routing        :p1e, 2026-04-15, 1w
+        PauseMode.KEEP integration      :p1f, after p1e, 2w
+        Production-ready milestone      :milestone, p1m, 2026-05-15, 0d
+
+    section Phase 2 · Adapters + Wide-EP
+        Python client SDK               :p2a, 2026-05-15, 2w
+        veRL adapter                    :p2b, after p2a, 2w
+        OpenRLHF adapter                :p2c, after p2a, 2w
+        Wide-EP rollout guide           :p2d, 2026-05-15, 3w
+        Wide-EP benchmark vs SGLang     :p2e, after p2d, 2w
+        WVA integration for RL          :p2f, 2026-06-01, 2w
+        Framework adoption milestone    :milestone, p2m, 2026-07-01, 0d
+
+    section Phase 3 · Advanced
+        Reward-model sidecar            :p3a, 2026-07-01, 3w
+        Active partial rollouts         :p3b, after p3a, 3w
+        RolloutEnginePool CRD           :p3c, 2026-07-15, 4w
+        OpenTelemetry tracing           :p3d, 2026-08-01, 2w
+```
+
 ## Phases
 
 ### Phase 0: Foundation (Weeks 1–4)
@@ -95,6 +136,62 @@ Novel primitives that differentiate llm-d from any existing solution.
 - [ ] **Grafana dashboard:** Pre-built dashboard for RL rollout operations
 
 ---
+
+## Dependency Graph
+
+```mermaid
+graph TB
+    subgraph "vLLM Upstream"
+        V1["WeightTransferEngine<br/>(NCCL backend)"]
+        V2["PauseMode.KEEP"]
+        V3["Sleep/Wake API"]
+        V4["load_format=dummy"]
+        V5["HTTP dev-mode endpoints"]
+    end
+
+    subgraph "llm-d Upstream"
+        L1["Inference Scheduler<br/>(EPP)"]
+        L2["KV-Cache Indexer"]
+        L3["Workload Variant<br/>Autoscaler"]
+        L4["fast-model-actuation"]
+        L5["inference-sim"]
+    end
+
+    subgraph "llm-d-rl"
+        R1["Weight Sync<br/>Coordinator"]
+        R2["Engine Pool<br/>Manager"]
+        R3["Rollout Controller<br/>(HTTP server)"]
+        R4["Python Client SDK"]
+        R5["Framework Adapters"]
+        R6["RolloutEnginePool CRD"]
+    end
+
+    V1 --> R1
+    V2 --> R1
+    V3 --> R2
+    V4 --> R2
+    V5 --> R1
+    V5 --> R2
+
+    L1 --> R3
+    L2 --> R3
+    L3 --> R2
+    L4 --> R2
+    L5 --> R3
+
+    R1 --> R3
+    R2 --> R3
+    R3 --> R4
+    R4 --> R5
+    R3 --> R6
+
+    style R1 fill:#e8f4e8,stroke:#66aa66
+    style R2 fill:#e8f4e8,stroke:#66aa66
+    style R3 fill:#e8f4e8,stroke:#66aa66
+    style R4 fill:#fff3e0,stroke:#cc9944
+    style R5 fill:#fff3e0,stroke:#cc9944
+    style R6 fill:#ffeaea,stroke:#cc6666
+```
 
 ## Dependencies and Upstream Work
 
