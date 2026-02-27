@@ -1,19 +1,5 @@
 # llm-d RL Rollout Infrastructure North Star
 
-**Author(s):** Carlos Costa
-
-**Contributor(s):** _TBD_
-
----
-
-## Ongoing/Completed Efforts
-
-Since the writing of this doc, the following efforts have been established to drive towards the North Star:
-
-- _Initial proposal — no implementation yet_
-
----
-
 ## Background
 
 The RL post-training ecosystem is taking shape rapidly but remains fragmented across frameworks like [veRL](https://github.com/volcengine/verl), [Slime](https://github.com/THUDM/slime), [SkyRL](https://github.com/NovaSky-AI/SkyRL), [OpenRLHF](https://github.com/OpenRLHF/OpenRLHF), and [NeMo-RL](https://github.com/NVIDIA-NeMo/RL). While each has its own opinions on training orchestration, algorithm implementation, and reward modeling, they all depend on the same low-level **rollout infrastructure** — the inference engine pool that generates token sequences during RL training loops.
