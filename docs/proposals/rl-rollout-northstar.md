@@ -1,8 +1,8 @@
-# llm-d RL Rollout Infrastructure North Star
+# llm-d RL rollout infrastructure north star
 
 ## Background
 
-The RL post-training ecosystem is taking shape rapidly but remains fragmented across frameworks like [veRL](https://github.com/volcengine/verl), [Slime](https://github.com/THUDM/slime), [SkyRL](https://github.com/NovaSky-AI/SkyRL), [OpenRLHF](https://github.com/OpenRLHF/OpenRLHF), and [NeMo-RL](https://github.com/NVIDIA-NeMo/RL). While each has its own opinions on training orchestration, algorithm implementation, and reward modeling, they all depend on the same low-level **rollout infrastructure** — the inference engine pool that generates token sequences during RL training loops.
+The RL post-training ecosystem is taking shape rapidly but remains fragmented across frameworks like [veRL](https://github.com/volcengine/verl), [Slime](https://github.com/THUDM/slime), [SkyRL](https://github.com/NovaSky-AI/SkyRL), [OpenRLHF](https://github.com/OpenRLHF/OpenRLHF), and [NeMo-RL](https://github.com/NVIDIA-NeMo/RL). While each has its own opinions on training orchestration, algorithm implementation, and reward modeling, they all depend on the same low-level rollout infrastructure — the inference engine pool that generates token sequences during RL training loops.
 
 Today, every framework re-implements this infrastructure as framework-specific glue code tightly coupled to a single inference engine (usually vLLM or SGLang) and a single orchestrator (Ray). There is no shared, reusable, production-grade rollout layer.
 
@@ -12,9 +12,9 @@ Useful context for this document:
 
 ## TL;DR
 
-Every major RL post-training framework needs the same five rollout primitives from its inference layer: **weight synchronization**, **engine lifecycle management**, **load-aware routing**, **asynchronous generation**, and **partial rollout control**. Today each framework builds these as ad-hoc glue code tightly coupled to a specific inference engine and orchestrator.
+Every major RL post-training framework needs the same five rollout primitives from its inference layer: weight synchronization, engine lifecycle management, load-aware routing, asynchronous generation, and partial rollout control. Today each framework builds these as ad-hoc glue code tightly coupled to a specific inference engine and orchestrator.
 
-The llm-d RL Rollout Infrastructure proposes to **extract these five primitives into a Kubernetes-native, framework-agnostic rollout service** that any RL training loop can consume. By exposing an HTTP/gRPC control plane with a high-performance NCCL/NIXL data plane for weight transfer, llm-d becomes the neutral infrastructure layer beneath all RL frameworks — replacing what Ray does for inference management while letting frameworks keep Ray for training orchestration.
+The llm-d RL rollout infrastructure proposes to extract these five primitives into a Kubernetes-native, framework-agnostic rollout service that any RL training loop can consume. By exposing an HTTP/gRPC control plane with a high-performance NCCL/NIXL data plane for weight transfer, llm-d becomes the neutral infrastructure layer beneath all RL frameworks — replacing what Ray does for inference management while letting frameworks keep Ray for training orchestration.
 
 This positions vLLM+llm-d as the natural entry point for any lab doing RL post-training, regardless of which framework they choose.
 
@@ -50,16 +50,16 @@ sequenceDiagram
     Note over TL: 12. Repeat from step 1
 ```
 
-**In scope (bordered in blue):** Steps 2–4 (generation dispatch and routing) and steps 8–11 (weight synchronization lifecycle). These are the **rollout infrastructure primitives** — the components llm-d provides as a managed service.
+In scope: steps 2–4 (generation dispatch and routing) and steps 8–11 (weight synchronization lifecycle). These are the rollout infrastructure primitives — the components llm-d provides as a managed service.
 
-**Out of scope:** The training loop itself (step 1, 6, 7, 12), reward computation, algorithm choice (PPO vs. GRPO vs. DAPO), and training-side gradient synchronization. These remain the responsibility of the RL framework.
+Out of scope: the training loop itself (step 1, 6, 7, 12), reward computation, algorithm choice (PPO vs. GRPO vs. DAPO), and training-side gradient synchronization. These remain the responsibility of the RL framework.
 
 Expanding scope to include reward-model-driven trajectory pruning (active partial rollouts) is a stretch goal discussed below.
 
 
 ## Goal
 
-This rollout infrastructure is intended to be the **production-grade, framework-agnostic standard** for RL inference rollout on Kubernetes. The expectation is that this layer will be adopted due to:
+This rollout infrastructure is intended to be the production-grade, framework-agnostic standard for RL inference rollout on Kubernetes. The expectation is that this layer will be adopted due to:
 
 - **Framework independence** — works with any RL framework via standard APIs
 - **Kubernetes-native operations** — health checks, auto-recovery, autoscaling, topology-aware placement
@@ -68,9 +68,7 @@ This rollout infrastructure is intended to be the **production-grade, framework-
 
 The remainder of this document explores how each of these is achieved.
 
----
-
-## Rollout Primitives
+## Rollout primitives
 
 ### Analysis: what every framework builds
 
@@ -87,7 +85,7 @@ We conducted a deep technical analysis of five major RL frameworks. The followin
 | **Orchestrator** | Ray | Ray | Ray | Ray | Ray |
 | **K8s-native?** | No | No | No | No | No |
 
-**Key observations:**
+Key observations:
 
 1. **All five frameworks use Ray** as their orchestrator and manage inference engines as Ray actors. None are Kubernetes-native.
 2. **All five implement the same weight sync patterns** — CUDA IPC for colocated GPUs, NCCL broadcast for disaggregated. The implementations are nearly identical.
@@ -95,18 +93,18 @@ We conducted a deep technical analysis of five major RL frameworks. The followin
 4. **Load routing ranges from nonexistent to primitive** — no framework leverages KV-cache locality, prefix reuse, or predicted latency.
 5. **Async generation is everywhere but inconsistent** — each framework invents its own staleness control, backpressure, and version tracking.
 
-### Primitive 1: Weight Synchronization
+### Primitive 1: weight synchronization
 
-**The problem:** After each training step, updated model weights must be pushed to live inference engines without restarting them. This is the most performance-critical primitive — large models (70B+ parameters) require transferring tens of gigabytes of weight data.
+The problem: after each training step, updated model weights must be pushed to live inference engines without restarting them. This is the most performance-critical primitive — large models (70B+ parameters) require transferring tens of gigabytes of weight data.
 
-**Current state:** Every framework implements its own weight transfer pipeline using the same two mechanisms:
+Current state: every framework implements its own weight transfer pipeline using the same two mechanisms:
 
 - **Colocated (same GPU):** CUDA IPC handles + ZMQ metadata channel for zero-copy transfer
 - **Disaggregated (different GPUs):** NCCL broadcast from trainer rank 0 to all engine workers
 
 vLLM already has native support for both via the `WeightTransferEngine` abstraction (NCCL backend with packed tensor transfer, layerwise reload with auto-requantization) and HTTP endpoints (`/init_weight_transfer_engine`, `/update_weights`) behind `VLLM_SERVER_DEV_MODE`.
 
-**What llm-d provides:**
+What llm-d provides:
 
 ```mermaid
 flowchart LR
@@ -118,22 +116,22 @@ flowchart LR
 
 ```
 
-- A **weight sync controller** that orchestrates the full lifecycle: pause generation → establish transfer group → transfer weights → reset KV cache → resume generation
-- Support for multiple transport backends: **NCCL** (default), **NIXL/RDMA** (high-performance cross-node), and **checkpoint path** (load from shared storage)
+- A weight sync controller that orchestrates the full lifecycle: pause generation → establish transfer group → transfer weights → reset KV cache → resume generation
+- Support for multiple transport backends: NCCL (default), NIXL/RDMA (high-performance cross-node), and checkpoint path (load from shared storage)
 - **Packed tensor transfer** with double-buffering for bandwidth efficiency (matching vLLM's 1GB buffer pipeline)
 - **Weight version tracking** — every engine reports its current weight version; the controller ensures consistency across the pool
-- Transparent handling of **quantization mismatches** — trainers send bf16/fp16, llm-d leverages vLLM's layerwise reload to auto-requantize for fp8/int4 inference
+- Transparent handling of quantization mismatches — trainers send bf16/fp16, llm-d leverages vLLM's layerwise reload to auto-requantize for fp8/int4 inference
 
-### Primitive 2: Engine Lifecycle Management
+### Primitive 2: engine lifecycle management
 
-**The problem:** Inference engines must be started, health-checked, recovered on failure, and have their GPU memory managed (sleep/wake) when sharing resources with training.
+The problem: inference engines must be started, health-checked, recovered on failure, and have their GPU memory managed (sleep/wake) when sharing resources with training.
 
-**Current state:** Only Slime has health monitoring with auto-restart. All other frameworks crash on engine failure. vLLM provides three sleep levels (0: pause scheduling, 1: offload weights to CPU, 2: discard all GPU memory) and tagged wake-up (weights, kv_cache independently).
+Current state: only Slime has health monitoring with auto-restart. All other frameworks crash on engine failure. vLLM provides three sleep levels (0: pause scheduling, 1: offload weights to CPU, 2: discard all GPU memory) and tagged wake-up (weights, kv_cache independently).
 
-**What llm-d provides:**
+What llm-d provides:
 
 - **Kubernetes-native pod lifecycle** — liveness probes, readiness gates, automatic pod replacement
-- An **engine pool controller** that maintains N healthy engines, replacing failed ones and reconnecting weight sync groups
+- An engine pool controller that maintains N healthy engines, replacing failed ones and reconnecting weight sync groups
 - **Sleep/wake orchestration** for colocated deployments, as shown below
 - **Mode transitions** exposed via CRD status:
 
@@ -190,42 +188,42 @@ sequenceDiagram
     Note over EP: Phase: Serving (ready for next rollout)
 ```
 
-### Primitive 3: Load-Aware Routing
+### Primitive 3: load-aware routing
 
-**The problem:** Generation requests must be distributed across engine instances for maximum throughput.
+The problem: generation requests must be distributed across engine instances for maximum throughput.
 
-**Current state:** Ranges from nothing (veRL) to simple min-heap by queue depth (OpenRLHF). No framework leverages KV-cache locality, prefix reuse, or predicted latency — capabilities llm-d already has.
+Current state: ranges from nothing (veRL) to simple min-heap by queue depth (OpenRLHF). No framework leverages KV-cache locality, prefix reuse, or predicted latency — capabilities llm-d already has.
 
-**What llm-d provides:**
+What llm-d provides:
 
-- The existing **inference scheduler (EPP)** with KV-cache-aware routing, prefix-cache affinity, and predicted latency scoring
+- The existing inference scheduler (EPP) with KV-cache-aware routing, prefix-cache affinity, and predicted latency scoring
 - **Session affinity** for multi-turn RL rollouts — keeps KV cache warm on the same engine across conversation turns
 - **RL-specific routing policies** — e.g., route reward model scoring and policy generation to different engine pools
 - **Batch-aware dispatch** — understands RL batch boundaries and distributes evenly across engines
 
-### Primitive 4: Asynchronous Generation
+### Primitive 4: asynchronous generation
 
-**The problem:** Overlapping generation with training increases GPU utilization, but requires careful coordination of weight versions, staleness bounds, and backpressure.
+The problem: overlapping generation with training increases GPU utilization, but requires careful coordination of weight versions, staleness bounds, and backpressure.
 
-**Current state:** Every framework has some form of async generation, but implementations differ significantly. SkyRL has the best staleness control (capacity-based bounds from the AReal paper). NeMo-RL tracks weight versions in a replay buffer. OpenRLHF uses token-bucket backpressure.
+Current state: every framework has some form of async generation, but implementations differ significantly. SkyRL has the best staleness control (capacity-based bounds from the AReal paper). NeMo-RL tracks weight versions in a replay buffer. OpenRLHF uses token-bucket backpressure.
 
-**What llm-d provides:**
+What llm-d provides:
 
-- A **generation service** with built-in request queuing, priority, and backpressure
+- A generation service with built-in request queuing, priority, and backpressure
 - **Weight version tagging** — every generated output is tagged with the weight version that produced it
 - **In-flight weight update support** using vLLM's `PauseMode.KEEP` — freeze requests in place, swap weights, resume without discarding partial work
 - **Configurable staleness bounds** — the controller can reject or deprioritize generations from stale weight versions
 
-### Primitive 5: Active Partial Rollouts (Stretch Goal)
+### Primitive 5: active partial rollouts (stretch goal)
 
-**The problem:** In RL training, many generated trajectories are low-quality and waste compute. Pruning unpromising trajectories mid-generation could free significant resources.
+The problem: in RL training, many generated trajectories are low-quality and waste compute. Pruning unpromising trajectories mid-generation could free significant resources.
 
-**Current state:** This is the least developed primitive. Slime has dynamic sampling with oversampling + filtering. SkyRL can abort and retry with accumulated tokens. No framework scores trajectories mid-generation with a reward model.
+Current state: this is the least developed primitive. Slime has dynamic sampling with oversampling + filtering. SkyRL can abort and retry with accumulated tokens. No framework scores trajectories mid-generation with a reward model.
 
-**What llm-d could provide:**
+What llm-d could provide:
 
-- A **reward-model sidecar** that scores partial generations in real-time
-- An **abort policy** in the inference scheduler that terminates low-reward trajectories
+- A reward-model sidecar that scores partial generations in real-time
+- An abort policy in the inference scheduler that terminates low-reward trajectories
 - **Compute reallocation** — freed capacity from pruned trajectories is immediately available for more promising ones
 - Integration with the existing request lifecycle (cancel, redirect) in the EPP
 
@@ -233,9 +231,9 @@ sequenceDiagram
 
 ## Architecture
 
-### Integration Model: HTTP Control Plane + NCCL/NIXL Data Plane
+### Integration model: HTTP control plane + NCCL/NIXL data plane
 
-The key architectural decision is how RL training loops (running in Ray) communicate with llm-d (running on Kubernetes). We propose a **hybrid approach**:
+The key architectural decision is how RL training loops (running in Ray) communicate with llm-d (running on Kubernetes). We propose a hybrid approach:
 
 ```mermaid
 graph TB
@@ -268,7 +266,7 @@ graph TB
 
 ```
 
-The **two communication paths** are intentionally separate:
+The two communication paths are intentionally separate:
 
 ```mermaid
 graph LR
@@ -290,36 +288,36 @@ graph LR
 
 ```
 
-**Why this split:**
+Why this split:
 
-- **Control plane (HTTP/gRPC):** Generation requests, pause/resume, lifecycle queries, weight sync orchestration. Goes through llm-d's inference scheduler for intelligent routing. Accessible from any language/framework without dependencies.
-- **Data plane (NCCL/NIXL):** Actual weight tensor transfer. Direct GPU-to-GPU between training nodes and vLLM pods. llm-d orchestrates group setup but does not proxy tensor data. This matches vLLM's native `WeightTransferEngine` pattern.
+- **Control plane (HTTP/gRPC):** generation requests, pause/resume, lifecycle queries, weight sync orchestration. Goes through llm-d's inference scheduler for intelligent routing. Accessible from any language/framework without dependencies.
+- **Data plane (NCCL/NIXL):** actual weight tensor transfer. Direct GPU-to-GPU between training nodes and vLLM pods. llm-d orchestrates group setup but does not proxy tensor data. This matches vLLM's native `WeightTransferEngine` pattern.
 
-**Why not Ray inside llm-d:**
+Why not Ray inside llm-d:
 
 - Loses the Kubernetes-native advantage (LWS provides better topology-aware placement, all-or-nothing failure semantics)
 - Couples llm-d to Ray's versioning and runtime model
 - Frameworks keep using Ray for training; llm-d replaces what Ray does for inference management
 - The HTTP/gRPC boundary is what makes it truly framework-agnostic
 
-### Relationship to Existing llm-d Components
+### Relationship to existing llm-d components
 
-| Existing Component | RL Rollout Application |
+| Existing component | RL rollout application |
 |---|---|
-| **Inference Scheduler (EPP)** | Routes generation requests with KV-cache awareness and session affinity |
-| **KV-Cache Indexer** | Tracks block locality for prefix reuse across multi-turn RL rollouts |
-| **P/D Disaggregation** | Separates prefill (new prompts) from decode (continuations) |
-| **Workload Variant Autoscaler** | Scales engine pool based on RL training demand signals |
+| **Inference scheduler (EPP)** | Routes generation requests with KV-cache awareness and session affinity |
+| **KV-cache indexer** | Tracks block locality for prefix reuse across multi-turn RL rollouts |
+| **P/D disaggregation** | Separates prefill (new prompts) from decode (continuations) |
+| **Workload variant autoscaler** | Scales engine pool based on RL training demand signals |
 | **NIXL / pd-utils** | RDMA transport for high-bandwidth weight transfer |
 | **fast-model-actuation** | Sleep/wake lifecycle management for colocated deployments |
 
-The RL rollout infrastructure is **not a separate stack** — it extends llm-d's existing components with new coordination logic and APIs for the RL use case.
+The RL rollout infrastructure is not a separate stack — it extends llm-d's existing components with new coordination logic and APIs for the RL use case.
 
 ---
 
-## API Surface
+## API surface
 
-### Rollout Control API (HTTP/gRPC)
+### Rollout control API (HTTP/gRPC)
 
 ```
 service RolloutControl {
@@ -384,7 +382,7 @@ message WakeUpRequest {
 }
 ```
 
-### Kubernetes CRD (Future)
+### Kubernetes CRD (future)
 
 ```yaml
 apiVersion: llm-d.io/v1alpha1
@@ -415,33 +413,33 @@ status:
 
 ## Alternatives
 
-### Let Each Framework Manage Its Own Engines
+### Let each framework manage its own engines
 
 This is the status quo. Every framework bundles its own inference management as Ray actors with framework-specific glue code.
 
-Unlike this approach, llm-d RL Rollout:
+Unlike this approach, llm-d RL rollout:
 
 - Provides Kubernetes-native operations (health, auto-restart, autoscaling) that no framework has
 - Eliminates redundant re-implementation across five+ frameworks
 - Enables labs to switch RL frameworks without changing their inference infrastructure
 - Leverages llm-d's existing scheduling, KV-cache indexing, and NIXL capabilities
 
-### Build on SGLang (Slime's Approach)
+### Build on SGLang (Slime's approach)
 
 Slime demonstrates the most complete rollout infrastructure today, but it is deeply coupled to SGLang's internal APIs (`FlattenedTensorBucket`, `MultiprocessingSerializer`, `ServerArgs`).
 
-Unlike Slime's approach, llm-d RL Rollout:
+Unlike Slime's approach, llm-d RL rollout:
 
 - Works with vLLM, SGLang, or any OpenAI-compatible engine
 - Does not import or depend on inference engine internals
 - Operates via standard HTTP/gRPC APIs and NCCL/NIXL data plane
 - Provides Kubernetes-native lifecycle management rather than Ray actor management
 
-### Build a Ray-Native Rollout Service
+### Build a Ray-native rollout service
 
 An alternative would be to ship llm-d rollout components as Ray actors that frameworks can drop in.
 
-Unlike a Ray-native approach, llm-d RL Rollout:
+Unlike a Ray-native approach, llm-d RL rollout:
 
 - Does not take a dependency on Ray's versioning and runtime model
 - Leverages Kubernetes primitives (LWS, HPA, pod lifecycle) for operations
@@ -452,7 +450,7 @@ Unlike a Ray-native approach, llm-d RL Rollout:
 
 Dynamo's Distributed Runtime provides some overlapping capabilities (weight management, engine lifecycle).
 
-Unlike Dynamo, llm-d RL Rollout:
+Unlike Dynamo, llm-d RL rollout:
 
 - Is open-source and vendor-neutral
 - Operates above the engine (does not require Dynamo's runtime inside vLLM)
@@ -460,9 +458,9 @@ Unlike Dynamo, llm-d RL Rollout:
 - Supports multiple accelerator families
 
 
-## Competitive Landscape: Why Urgency Matters
+## Competitive landscape: why urgency matters
 
-**Slime + SGLang** is currently the most complete RL rollout stack and is driving SGLang adoption in the RL community. Labs that adopt Slime become effectively locked into SGLang as their inference engine. Key advantages Slime has today:
+Slime + SGLang is currently the most complete RL rollout stack and is driving SGLang adoption in the RL community. Labs that adopt Slime become effectively locked into SGLang as their inference engine. Key advantages Slime has today:
 
 - Health monitoring with automatic engine replacement
 - Colocated training with CUDA VMM-based memory management
@@ -470,12 +468,12 @@ Unlike Dynamo, llm-d RL Rollout:
 - Tight integration with SGLang's weight update APIs
 - Wide-EP support for DeepSeek-class MoE models
 
-**Our window to intercept this:** These adoption decisions are being made now. Switching costs compound over time. If we can deliver **Wide-EP parity plus a clean rollout API**, the framework layer becomes more commoditized and we own the infrastructure beneath all of them.
+Our window to intercept this: these adoption decisions are being made now. Switching costs compound over time. If we can deliver Wide-EP parity plus a clean rollout API, the framework layer becomes more commoditized and we own the infrastructure beneath all of them.
 
-**The counter-strategy:** Make vLLM+llm-d provide all five rollout primitives natively and with superior operational characteristics (K8s-native health, auto-recovery, topology-aware placement, KV-cache-aware routing). Labs can then choose their RL framework independently of their inference engine.
+The counter-strategy: make vLLM+llm-d provide all five rollout primitives natively and with superior operational characteristics (K8s-native health, auto-recovery, topology-aware placement, KV-cache-aware routing). Labs can then choose their RL framework independently of their inference engine.
 
 
-## Cross-Community Investment
+## Cross-community investment
 
 Cross-community investment is key for this layer to become the standard. Initial outreach:
 
