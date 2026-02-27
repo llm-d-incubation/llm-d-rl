@@ -78,10 +78,10 @@ We conducted a deep technical analysis of five major RL frameworks. The followin
 |---|---|---|---|---|---|
 | **Engine(s)** | vLLM, SGLang, TRT-LLM | SGLang only | vLLM, SGLang, Remote | vLLM only | vLLM, SGLang, Megatron |
 | **Weight sync** | CUDA IPC / NCCL / NIXL | CUDA IPC / NCCL (SGLang) | CUDA IPC / NCCL | NCCL / CUDA IPC | ZMQ IPC / NCCL / HTTP |
-| **Health checks** | None | Yes + auto-restart | Poll only | None | None |
-| **Load routing** | None | Least-inflight | Round-robin / hash | Min-heap (queue depth) | Round-robin |
-| **Async gen** | Experimental | Semi + fully async | Fully async (staleness) | Async (backpressure) | Async (replay buffer) |
-| **Partial rollout** | No | Dynamic sampling | Abort + retry | No | In-flight weight updates |
+| **Health checks** | Worker aliveness + HTTP polling | Yes + auto-restart | Poll only | None | None |
+| **Load routing** | SGLang router + hash-based | Least-inflight | Round-robin / hash | Min-heap (queue depth) | Round-robin |
+| **Async gen** | Yes (async rollout mode) | Semi + fully async | Fully async (staleness) | Async (backpressure) | Async (replay buffer) |
+| **Partial rollout** | Abort/resume (async mode) | Dynamic sampling | Abort + retry | No | In-flight weight updates |
 | **Orchestrator** | Ray | Ray | Ray | Ray | Ray |
 | **K8s-native?** | No | No | No | No | No |
 
@@ -89,8 +89,8 @@ Key observations:
 
 1. **All five frameworks use Ray** as their orchestrator and manage inference engines as Ray actors. None are Kubernetes-native.
 2. **All five implement the same weight sync patterns** — CUDA IPC for colocated GPUs, NCCL broadcast for disaggregated. The implementations are nearly identical.
-3. **Only Slime has production-grade health monitoring** with automatic engine replacement. Every other framework crashes on engine failure.
-4. **Load routing ranges from nonexistent to primitive** — no framework leverages KV-cache locality, prefix reuse, or predicted latency.
+3. **Slime has the most complete health monitoring** with automatic engine replacement. veRL has worker aliveness checks (background thread with SIGABRT on failure) and HTTP health polling, but no automatic replacement. Other frameworks crash on engine failure.
+4. **Load routing ranges from basic to primitive** — veRL integrates SGLang's router and has hash-based session routing, but no framework leverages KV-cache locality, prefix reuse, or predicted latency.
 5. **Async generation is everywhere but inconsistent** — each framework invents its own staleness control, backpressure, and version tracking.
 
 ### Primitive 1: weight synchronization
@@ -120,13 +120,13 @@ flowchart LR
 - Support for multiple transport backends: NCCL (default), NIXL/RDMA (high-performance cross-node), and checkpoint path (load from shared storage)
 - **Packed tensor transfer** with double-buffering for bandwidth efficiency (matching vLLM's 1GB buffer pipeline)
 - **Weight version tracking** — every engine reports its current weight version; the controller ensures consistency across the pool
-- Transparent handling of quantization mismatches — trainers send bf16/fp16, llm-d leverages vLLM's layerwise reload to auto-requantize for fp8/int4 inference
+- Transparent handling of quantization mismatches — trainers send bf16/fp16, llm-d leverages vLLM's layerwise reload to process and repack weights for fp8/int4 inference
 
 ### Primitive 2: engine lifecycle management
 
 The problem: inference engines must be started, health-checked, recovered on failure, and have their GPU memory managed (sleep/wake) when sharing resources with training.
 
-Current state: only Slime has health monitoring with auto-restart. All other frameworks crash on engine failure. vLLM provides three sleep levels (0: pause scheduling, 1: offload weights to CPU, 2: discard all GPU memory) and tagged wake-up (weights, kv_cache independently).
+Current state: Slime has the most complete health monitoring with auto-restart. veRL has worker aliveness monitoring and HTTP health polling but no automatic replacement. Other frameworks crash on engine failure. vLLM provides three sleep levels (0: pause scheduling, 1: offload weights to CPU, 2: discard all GPU memory) and tagged wake-up (weights, kv_cache independently).
 
 What llm-d provides:
 
@@ -192,7 +192,7 @@ sequenceDiagram
 
 The problem: generation requests must be distributed across engine instances for maximum throughput.
 
-Current state: ranges from nothing (veRL) to simple min-heap by queue depth (OpenRLHF). No framework leverages KV-cache locality, prefix reuse, or predicted latency — capabilities llm-d already has.
+Current state: ranges from basic routing (veRL's SGLang router integration with hash-based session affinity) to simple min-heap by queue depth (OpenRLHF). No framework leverages KV-cache locality, prefix reuse, or predicted latency — capabilities llm-d already has.
 
 What llm-d provides:
 
