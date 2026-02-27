@@ -6,14 +6,9 @@ The RL post-training ecosystem is taking shape rapidly but remains fragmented ac
 
 Today, every framework re-implements this infrastructure as framework-specific glue code tightly coupled to a single inference engine (usually vLLM or SGLang) and a single orchestrator (Ray). There is no shared, reusable, production-grade rollout layer.
 
-Included below are artifacts providing useful context for this document:
-
-- [llm-d Project Proposal](https://github.com/llm-d/llm-d/blob/main/docs/proposals/llm-d.md)
-- [llm-d Scheduler North Star](https://docs.google.com/document/d/1kE1LY8OVjiOgKVD9-9Po96HODbTIbgHp4qgvw06BCOc/edit)
-- [llm-d 0.6 Roadmap — Initial RL Support](https://github.com/llm-d/llm-d/blob/main/docs/proposals/roadmap-0.6.md)
+Useful context for this document:
 - [vLLM RLHF Documentation](https://docs.vllm.ai/en/latest/training/rlhf.html)
 
----
 
 ## TL;DR
 
@@ -23,7 +18,6 @@ The llm-d RL Rollout Infrastructure proposes to **extract these five primitives 
 
 This positions vLLM+llm-d as the natural entry point for any lab doing RL post-training, regardless of which framework they choose.
 
----
 
 ## Scope
 
@@ -62,7 +56,6 @@ sequenceDiagram
 
 Expanding scope to include reward-model-driven trajectory pruning (active partial rollouts) is a stretch goal discussed below.
 
----
 
 ## Goal
 
@@ -77,9 +70,9 @@ The remainder of this document explores how each of these is achieved.
 
 ---
 
-## The Five Rollout Primitives
+## Rollout Primitives
 
-### Analysis: What Every Framework Builds
+### Analysis: what every framework builds
 
 We conducted a deep technical analysis of five major RL frameworks. The following table summarizes how each implements the common rollout infrastructure:
 
@@ -420,8 +413,6 @@ status:
   lastWeightSync: "2026-02-27T10:00:00Z"
 ```
 
----
-
 ## Alternatives
 
 ### Let Each Framework Manage Its Own Engines
@@ -468,7 +459,6 @@ Unlike Dynamo, llm-d RL Rollout:
 - Composes with existing Kubernetes infrastructure
 - Supports multiple accelerator families
 
----
 
 ## Competitive Landscape: Why Urgency Matters
 
@@ -484,7 +474,6 @@ Unlike Dynamo, llm-d RL Rollout:
 
 **The counter-strategy:** Make vLLM+llm-d provide all five rollout primitives natively and with superior operational characteristics (K8s-native health, auto-recovery, topology-aware placement, KV-cache-aware routing). Labs can then choose their RL framework independently of their inference engine.
 
----
 
 ## Cross-Community Investment
 
