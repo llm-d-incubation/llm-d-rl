@@ -148,12 +148,21 @@ func (pm *PoolManager) PickReadyEngine() (*EngineInfo, error) {
 
 // RunHealthChecks runs a single round of health checks on all engines.
 func (pm *PoolManager) RunHealthChecks(ctx context.Context) {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
+	// Snapshot engines under read lock so health checks run without holding the lock.
+	pm.mu.RLock()
+	type entry struct {
+		id string
+		es *engineState
+	}
+	entries := make([]entry, 0, len(pm.engines))
+	for id, es := range pm.engines {
+		entries = append(entries, entry{id, es})
+	}
+	pm.mu.RUnlock()
 
 	var wg sync.WaitGroup
 
-	for id, es := range pm.engines {
+	for _, e := range entries {
 		wg.Add(1)
 		go func(id string, es *engineState) {
 			defer wg.Done()
@@ -164,8 +173,6 @@ func (pm *PoolManager) RunHealthChecks(ctx context.Context) {
 			err := es.info.Client.Health(checkCtx)
 
 			pm.mu.Lock()
-			defer pm.mu.Unlock()
-
 			es.lastHealthCheck = time.Now()
 
 			if err != nil {
@@ -180,7 +187,8 @@ func (pm *PoolManager) RunHealthChecks(ctx context.Context) {
 				es.consecutiveFailures = 0
 				es.ready = true
 			}
-		}(id, es)
+			pm.mu.Unlock()
+		}(e.id, e.es)
 	}
 
 	wg.Wait()
