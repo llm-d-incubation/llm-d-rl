@@ -1,0 +1,386 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ray-bench-script
+  namespace: llm-d-rl
+data:
+  ray_bench.py: |
+    """Ray orchestration harness for orchestration overhead benchmarking.
+
+    Simulates veRL's CheckpointEngineManager pattern: a Ray actor on a GPU
+    orchestrates vLLM engines through the same lifecycle, calling vLLM
+    dev-mode endpoints directly (bypassing the Go controller).
+    """
+
+    from __future__ import annotations
+
+    import argparse
+    import json
+    import logging
+    import os
+    import socket
+    import time
+    import threading
+    from contextlib import contextmanager
+    from urllib.request import Request, urlopen
+    from urllib.error import HTTPError
+
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    log = logging.getLogger("ray-bench")
+
+    @contextmanager
+    def timed(label, record):
+        start = time.perf_counter()
+        yield
+        record[label] = time.perf_counter() - start
+
+    def get_pod_ip():
+        return socket.gethostbyname(socket.gethostname())
+
+    def setup_nccl_group(master_address, master_port, world_size, device):
+        from vllm.distributed.utils import StatelessProcessGroup
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+        pg = StatelessProcessGroup.create(
+            host=master_address, port=master_port, rank=0, world_size=world_size)
+        pynccl = PyNcclCommunicator(pg, device=device)
+        return pynccl, pg
+
+    def broadcast_weights(pynccl, model, device):
+        stream = torch.cuda.Stream(device=device)
+        with torch.cuda.stream(stream):
+            for name, param in model.named_parameters():
+                pynccl.broadcast(param.data.contiguous(), src=0, stream=stream)
+        stream.synchronize()
+
+    class VLLMDirectClient:
+        """Calls vLLM dev-mode endpoints directly."""
+        def __init__(self, base_url, timeout=120.0):
+            self.base_url = base_url.rstrip("/")
+            self.timeout = timeout
+
+        def _post(self, path, body=None):
+            url = self.base_url + path
+            data = json.dumps(body or {}).encode()
+            req = Request(url, data=data, method="POST",
+                          headers={"Content-Type": "application/json"})
+            try:
+                with urlopen(req, timeout=self.timeout) as resp:
+                    content = resp.read()
+                    return json.loads(content) if content else {}
+            except HTTPError as exc:
+                body_text = exc.read().decode(errors="replace")
+                raise RuntimeError(f"POST {path} returned {exc.code}: {body_text}") from exc
+
+        def _get(self, path):
+            url = self.base_url + path
+            req = Request(url, method="GET")
+            try:
+                with urlopen(req, timeout=self.timeout) as resp:
+                    content = resp.read()
+                    return json.loads(content) if content else {}
+            except HTTPError as exc:
+                body_text = exc.read().decode(errors="replace")
+                raise RuntimeError(f"GET {path} returned {exc.code}: {body_text}") from exc
+
+        def health_check(self):
+            try:
+                self._get("/health")
+                return True
+            except Exception:
+                return False
+
+        def discover_model_name(self):
+            try:
+                data = self._get("/v1/models")
+                models = data.get("data", [])
+                if models:
+                    return models[0].get("id", "default")
+            except Exception:
+                pass
+            return "default"
+
+        def generate(self, model_name, prompt_token_ids, max_tokens=32):
+            return self._post("/v1/completions", {
+                "model": model_name, "prompt": prompt_token_ids,
+                "temperature": 0.7, "max_tokens": max_tokens,
+            })
+
+        def sleep(self, level=2):
+            return self._post("/sleep", {"level": level, "mode": "keep"})
+
+        def wake_up(self, tags):
+            return self._post("/wake_up", {"tags": tags})
+
+        def init_weight_transfer(self, master_address, master_port, world_size):
+            return self._post("/init_weight_transfer_engine", {
+                "init_info": {
+                    "master_address": master_address, "master_port": master_port,
+                    "rank_offset": 1, "world_size": world_size,
+                },
+            })
+
+        def update_weights(self, model):
+            names, dtype_names, shapes = [], [], []
+            for name, param in model.named_parameters():
+                names.append(name)
+                dtype_names.append(str(param.dtype).replace("torch.", ""))
+                shapes.append(list(param.shape))
+            return self._post("/update_weights", {
+                "update_info": {
+                    "names": names, "dtype_names": dtype_names,
+                    "shapes": shapes, "packed": False,
+                },
+            })
+
+    def make_ray_trainer_class():
+        import ray
+
+        @ray.remote(num_gpus=1)
+        class RayTrainerActor:
+            def __init__(self, engine_urls, model_name, master_port, device="cuda:0"):
+                self.device = torch.device(device)
+                self.engine_urls = engine_urls
+                self.model_name = model_name
+                self.master_port = master_port
+                self.clients = [VLLMDirectClient(url) for url in engine_urls]
+                self.model = None
+                self.pynccl = None
+                self.vllm_model_name = None
+
+            def setup(self):
+                logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+
+                load_start = time.perf_counter()
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name, torch_dtype=torch.bfloat16).to(self.device)
+                self.model.eval()
+                model_load_time = time.perf_counter() - load_start
+                num_params = sum(p.numel() for p in self.model.parameters())
+
+                self.vllm_model_name = self.clients[0].discover_model_name()
+
+                master_address = get_pod_ip()
+                world_size = 1 + len(self.clients)
+
+                nccl_result = [None, None]
+                nccl_error = [None]
+                def create_nccl():
+                    try:
+                        p, g = setup_nccl_group(master_address, self.master_port,
+                                                world_size, self.device)
+                        nccl_result[0] = p
+                        nccl_result[1] = g
+                    except Exception as e:
+                        nccl_error[0] = e
+
+                nccl_thread = threading.Thread(target=create_nccl, daemon=True)
+                nccl_thread.start()
+                time.sleep(1)
+
+                nccl_init_start = time.perf_counter()
+                for client in self.clients:
+                    client.init_weight_transfer(master_address, self.master_port, world_size)
+                nccl_thread.join(timeout=300)
+                nccl_init_time = time.perf_counter() - nccl_init_start
+
+                if nccl_error[0]:
+                    raise RuntimeError(f"NCCL setup failed: {nccl_error[0]}")
+                self.pynccl = nccl_result[0]
+
+                return {"model_load_time_s": model_load_time,
+                        "nccl_init_time_s": nccl_init_time,
+                        "num_params": num_params,
+                        "num_engines": len(self.clients)}
+
+            def run_step(self, step_num, weight_version):
+                t = {}
+                step_start = time.perf_counter()
+
+                with timed("generate", t):
+                    self.clients[0].generate(
+                        self.vllm_model_name, list(range(100, 120)), max_tokens=16)
+
+                with timed("sleep", t):
+                    for c in self.clients:
+                        c.sleep(level=2)
+
+                with timed("train", t):
+                    with torch.no_grad():
+                        for param in self.model.parameters():
+                            param.data += torch.randn_like(param.data) * 0.001
+
+                with timed("wake_weights", t):
+                    for c in self.clients:
+                        c.wake_up(tags=["weights"])
+
+                new_version = weight_version + 1
+                broadcast_error = [None]
+                broadcast_elapsed = [0.0]
+                def do_broadcast():
+                    try:
+                        time.sleep(0.5)
+                        bs = time.perf_counter()
+                        broadcast_weights(self.pynccl, self.model, self.device)
+                        broadcast_elapsed[0] = time.perf_counter() - bs
+                    except Exception as e:
+                        broadcast_error[0] = e
+
+                bt = threading.Thread(target=do_broadcast, daemon=True)
+                bt.start()
+                with timed("update_weights_http", t):
+                    for c in self.clients:
+                        c.update_weights(self.model)
+                bt.join(timeout=120)
+                if broadcast_error[0]:
+                    raise RuntimeError(f"NCCL failed: {broadcast_error[0]}")
+                t["nccl_broadcast"] = broadcast_elapsed[0]
+
+                with timed("wake_kvcache", t):
+                    for c in self.clients:
+                        c.wake_up(tags=["kv_cache"])
+
+                t["step_total"] = time.perf_counter() - step_start
+                t["step_num"] = step_num
+                t["weight_version"] = new_version
+                return t
+
+        return RayTrainerActor
+
+    def main():
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--engine-urls", required=True,
+                            help="Comma-separated vLLM engine URLs")
+        parser.add_argument("--model-name", default="meta-llama/Llama-3.1-8B-Instruct")
+        parser.add_argument("--master-port", type=int, default=29500)
+        parser.add_argument("--warmup-steps", type=int, default=5)
+        parser.add_argument("--measured-steps", type=int, default=20)
+        parser.add_argument("--output", default="/results/ray_results.json")
+        args = parser.parse_args()
+
+        logging.basicConfig(level=logging.INFO,
+                            format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+
+        import ray
+        ray.init()
+
+        engine_urls = [u.strip() for u in args.engine_urls.split(",")]
+        total_steps = args.warmup_steps + args.measured_steps
+
+        log.info("Engines: %s", engine_urls)
+        log.info("Model: %s", args.model_name)
+
+        # Wait for engines
+        temp_client = VLLMDirectClient(engine_urls[0])
+        start = time.time()
+        while time.time() - start < 600:
+            if temp_client.health_check():
+                break
+            time.sleep(10)
+        else:
+            raise TimeoutError("Engines not healthy after 600s")
+
+        RayTrainerActor = make_ray_trainer_class()
+        actor = RayTrainerActor.remote(engine_urls, args.model_name, args.master_port)
+
+        log.info("Setting up Ray trainer actor...")
+        setup_info = ray.get(actor.setup.remote())
+        log.info("Setup: %s", setup_info)
+
+        all_timings = []
+        weight_version = 0
+
+        for step in range(1, total_steps + 1):
+            is_warmup = step <= args.warmup_steps
+            label = "WARMUP" if is_warmup else "MEASURED"
+            log.info("%s Step %d/%d", label, step, total_steps)
+            t = ray.get(actor.run_step.remote(step, weight_version))
+            weight_version = t["weight_version"]
+            t["is_warmup"] = is_warmup
+            t["num_engines"] = len(engine_urls)
+            log.info("  total=%.3fs gen=%.3fs sleep=%.3fs train=%.3fs nccl=%.3fs",
+                     t["step_total"], t["generate"], t["sleep"],
+                     t["train"], t["nccl_broadcast"])
+            if not is_warmup:
+                all_timings.append(t)
+
+        results = {
+            "system": "ray", "model": args.model_name,
+            "num_engines": len(engine_urls), "num_params": setup_info["num_params"],
+            "warmup_steps": args.warmup_steps, "measured_steps": args.measured_steps,
+            "model_load_time_s": setup_info["model_load_time_s"],
+            "nccl_init_time_s": setup_info["nccl_init_time_s"],
+            "steps": all_timings,
+        }
+        os.makedirs(os.path.dirname(args.output), exist_ok=True)
+        with open(args.output, "w") as f:
+            json.dump(results, f, indent=2)
+        log.info("Results written to %s", args.output)
+        ray.shutdown()
+
+    if __name__ == "__main__":
+        main()
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ray-bench
+  namespace: llm-d-rl
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: ray-bench
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: trainer
+          image: vllm/vllm-openai:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              pip install ray && \
+              ray start --head --port=6379 --num-gpus=1 && \
+              python3 /scripts/ray_bench.py \
+                --engine-urls "$(ENGINE_URLS)" \
+                --model-name meta-llama/Llama-3.1-8B-Instruct \
+                --warmup-steps 5 \
+                --measured-steps 20 \
+                --output /results/ray_results.json
+          env:
+            - name: NCCL_DEBUG
+              value: "INFO"
+            - name: ENGINE_URLS
+              value: "http://vllm-engine-0.vllm-engine.llm-d-rl.svc.cluster.local:8000"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+                  optional: true
+          volumeMounts:
+            - name: bench-script
+              mountPath: /scripts
+              readOnly: true
+            - name: results
+              mountPath: /results
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+            requests:
+              nvidia.com/gpu: "1"
+              memory: "32Gi"
+              cpu: "4"
+      volumes:
+        - name: bench-script
+          configMap:
+            name: ray-bench-script
+        - name: results
+          emptyDir: {}
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
