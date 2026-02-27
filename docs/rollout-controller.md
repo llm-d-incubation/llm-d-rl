@@ -35,8 +35,13 @@ pkg/
   routing/                (placeholder for EPP integration)
 
 examples/
-  grpo_training_loop.py   Python reference client (GRPO training loop)
-  README.md               Run instructions and Slime-to-llm-d mapping
+  slime/
+    grpo_training_loop.py   Slime/GRPO training loop (7 phases, group-relative advantages)
+    README.md               Slime-to-llm-d mapping and run instructions
+  verl/
+    ppo_training_loop.py    veRL/PPO training loop (11 phases, critic + GAE)
+    README.md               veRL-to-llm-d mapping and run instructions
+  README.md                 Examples index
 ```
 
 ## API types
@@ -203,7 +208,7 @@ The controller never proxies weight tensors. It orchestrates the lifecycle (paus
 
 ### Framework-agnostic HTTP API
 
-The API uses standard HTTP/JSON so any language can consume it. The Python example (`examples/grpo_training_loop.py`) uses only `urllib` from the standard library — zero external dependencies. This makes it easy for framework authors to write adapters without importing Go-specific libraries.
+The API uses standard HTTP/JSON so any language can consume it. The Python example (`examples/slime/grpo_training_loop.py`) uses only `urllib` from the standard library — zero external dependencies. This makes it easy for framework authors to write adapters without importing Go-specific libraries.
 
 ### Simulated lifecycle for testing
 
@@ -218,7 +223,7 @@ Slime's weight update requires 5 separate Ray remote calls across all engines: p
 ### Dry run (no infrastructure)
 
 ```bash
-python3 examples/grpo_training_loop.py --dry-run
+python3 examples/slime/grpo_training_loop.py --dry-run
 ```
 
 ### Against a mock engine
@@ -257,7 +262,7 @@ go run ./cmd/rollout-controller \
   --simulate-lifecycle
 
 # Terminal 3: training loop
-python3 examples/grpo_training_loop.py \
+python3 examples/slime/grpo_training_loop.py \
   --controller-url http://localhost:8090 \
   --num-steps 3
 ```
@@ -274,7 +279,7 @@ go run ./cmd/rollout-controller \
   --engines http://localhost:8000
 
 # Terminal 3: training loop
-python3 examples/grpo_training_loop.py \
+python3 examples/slime/grpo_training_loop.py \
   --controller-url http://localhost:8090
 ```
 

@@ -80,7 +80,11 @@ make build
 ### Dry run (no infrastructure needed)
 
 ```bash
-python3 examples/grpo_training_loop.py --dry-run
+# Slime/GRPO example
+python3 examples/slime/grpo_training_loop.py --dry-run
+
+# veRL/PPO example
+python3 examples/verl/ppo_training_loop.py --dry-run
 ```
 
 Logs all HTTP calls without sending them.
@@ -96,9 +100,9 @@ go run ./cmd/rollout-controller \
   --engines http://localhost:8000 \
   --simulate-lifecycle
 
-# Terminal 3: run the training loop
-python3 examples/grpo_training_loop.py \
-  --controller-url http://localhost:8090
+# Terminal 3: run either training loop
+python3 examples/slime/grpo_training_loop.py --controller-url http://localhost:8090
+python3 examples/verl/ppo_training_loop.py --controller-url http://localhost:8090
 ```
 
 ### Against real vLLM engines
@@ -112,9 +116,9 @@ VLLM_SERVER_DEV_MODE=1 vllm serve meta-llama/Llama-3.1-8B-Instruct \
 go run ./cmd/rollout-controller \
   --engines http://localhost:8000
 
-# Terminal 3: training loop
-python3 examples/grpo_training_loop.py \
-  --controller-url http://localhost:8090
+# Terminal 3: run either training loop
+python3 examples/slime/grpo_training_loop.py --controller-url http://localhost:8090
+python3 examples/verl/ppo_training_loop.py --controller-url http://localhost:8090
 ```
 
 ### CLI flags
@@ -140,7 +144,9 @@ make docker-build   # build container image
 ## Documentation
 
 - [Rollout controller implementation](docs/rollout-controller.md) — how the controller is built, package by package
-- [GRPO training loop example](examples/README.md) — Slime-to-llm-d mapping and run instructions
+- [Examples](examples/README.md) — Slime/GRPO and veRL/PPO training loop examples
+  - [Slime/GRPO](examples/slime/) — GRPO with group-relative advantages (7 phases)
+  - [veRL/PPO](examples/verl/) — PPO with critic network and GAE (11 phases)
 - [North star design](docs/proposals/rl-rollout-northstar.md) — technical specification and framework analysis
 - [Roadmap](docs/proposals/roadmap.md) — multi-phase implementation plan
 
