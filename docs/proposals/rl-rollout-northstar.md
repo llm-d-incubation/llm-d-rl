@@ -227,7 +227,6 @@ What llm-d could provide:
 - **Compute reallocation** — freed capacity from pruned trajectories is immediately available for more promising ones
 - Integration with the existing request lifecycle (cancel, redirect) in the EPP
 
----
 
 ## Architecture
 
