@@ -131,6 +131,21 @@ func (pm *PoolManager) ReadyEngines() []weightsync.EngineClient {
 	return clients
 }
 
+// PickReadyEngine returns a ready engine's info for request dispatching.
+// Returns an error if no engines are ready.
+func (pm *PoolManager) PickReadyEngine() (*EngineInfo, error) {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+
+	for _, es := range pm.engines {
+		if es.ready {
+			info := es.info
+			return &info, nil
+		}
+	}
+	return nil, fmt.Errorf("no ready engines in pool")
+}
+
 // RunHealthChecks runs a single round of health checks on all engines.
 func (pm *PoolManager) RunHealthChecks(ctx context.Context) {
 	pm.mu.Lock()

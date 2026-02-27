@@ -9,8 +9,8 @@
 //
 //	rollout-controller \
 //	  --port=8090 \
-//	  --health-check-interval=30s \
-//	  --engine-discovery=kubernetes
+//	  --engines=http://localhost:8000 \
+//	  --simulate-lifecycle
 package main
 
 import (
@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -35,6 +36,8 @@ func main() {
 	var (
 		port                = flag.Int("port", 8090, "HTTP server port")
 		healthCheckInterval = flag.Duration("health-check-interval", 30*time.Second, "Interval between engine health checks")
+		engines             = flag.String("engines", "", "Comma-separated list of engine URLs (e.g., http://localhost:8000,http://localhost:8001)")
+		simulateLifecycle   = flag.Bool("simulate-lifecycle", false, "No-op lifecycle operations (pause, sleep, weight sync) for GPU-free demos with llm-d-inference-sim")
 		showVersion         = flag.Bool("version", false, "Print version and exit")
 	)
 	flag.Parse()
@@ -53,19 +56,46 @@ func main() {
 		HealthCheckInterval: *healthCheckInterval,
 		OnEngineUnhealthy: func(id string, err error) {
 			log.Printf("WARNING: engine %s is unhealthy: %v", id, err)
-			// TODO: Trigger Kubernetes pod replacement
 		},
 	})
 
-	server := rollout.NewServer(poolManager, coordinator)
+	// Register engines from --engines flag
+	if *engines != "" {
+		for i, rawURL := range strings.Split(*engines, ",") {
+			url := strings.TrimSpace(rawURL)
+			if url == "" {
+				continue
+			}
+			id := fmt.Sprintf("engine-%d", i)
 
-	// TODO: Engine discovery — watch Kubernetes pods with the rollout engine label
-	// and auto-register/unregister engines with the pool manager and coordinator.
+			var client weightsync.EngineClient
+			if *simulateLifecycle {
+				client = weightsync.NewSimulatedEngineClient(url)
+				log.Printf("Registered engine %s at %s (simulated lifecycle)", id, url)
+			} else {
+				client = weightsync.NewVLLMClient(url)
+				log.Printf("Registered engine %s at %s", id, url)
+			}
+
+			poolManager.AddEngine(lifecycle.EngineInfo{
+				ID:      id,
+				Address: url,
+				Client:  client,
+			})
+			coordinator.RegisterEngine(id, client)
+		}
+	}
+
+	server := rollout.NewServer(poolManager, coordinator)
 
 	// Start health check loop
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go poolManager.StartHealthLoop(ctx)
+
+	// Run an initial health check so engines are marked ready before
+	// the first request arrives.
+	poolManager.RunHealthChecks(ctx)
 
 	// Start HTTP server
 	httpServer := &http.Server{

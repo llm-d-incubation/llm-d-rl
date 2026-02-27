@@ -171,6 +171,24 @@ func (c *Coordinator) WeightVersion() int64 {
 	return c.weightVersion
 }
 
+// PauseAll pauses generation on all engines.
+func (c *Coordinator) PauseAll(ctx context.Context, mode v1alpha1.PauseMode) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.forEachEngine(ctx, func(ctx context.Context, id string, e EngineClient) error {
+		return e.Pause(ctx, mode)
+	})
+}
+
+// ResumeAll resumes generation on all engines.
+func (c *Coordinator) ResumeAll(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.forEachEngine(ctx, func(ctx context.Context, id string, e EngineClient) error {
+		return e.Resume(ctx)
+	})
+}
+
 // SleepAll puts all engines to sleep at the specified level.
 func (c *Coordinator) SleepAll(ctx context.Context, level v1alpha1.SleepLevel) error {
 	c.mu.Lock()

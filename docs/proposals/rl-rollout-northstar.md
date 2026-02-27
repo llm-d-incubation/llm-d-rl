@@ -2,7 +2,7 @@
 
 ## Background
 
-The RL post-training ecosystem is taking shape rapidly but remains fragmented across frameworks like [veRL](https://github.com/volcengine/verl), [Slime](https://github.com/THUDM/slime), [SkyRL](https://github.com/NovaSky-AI/SkyRL), [OpenRLHF](https://github.com/OpenRLHF/OpenRLHF), and [NeMo-RL](https://github.com/NVIDIA-NeMo/RL). While each has its own opinions on training orchestration, algorithm implementation, and reward modeling, they all depend on the same low-level rollout infrastructure — the inference engine pool that generates token sequences during RL training loops.
+The RL post-training ecosystem is taking shape rapidly but remains fragmented across frameworks like [veRL](https://github.com/volcengine/verl), [Slime](https://github.com/THUDM/slime), [SkyRL](https://github.com/NovaSky-AI/SkyRL), [OpenRLHF](https://github.com/OpenRLHF/OpenRLHF), and [NeMo-RL](https://github.com/NVIDIA-NeMo/RL). While each has its own opinions on training orchestration, algorithm implementation, and reward modeling, they all depend on the same low-level rollout infrastructure: the inference engine pool that generates token sequences during RL training loops.
 
 Today, every framework re-implements this infrastructure as framework-specific glue code tightly coupled to a single inference engine (usually vLLM or SGLang) and a single orchestrator (Ray). There is no shared, reusable, production-grade rollout layer.
 
@@ -14,7 +14,7 @@ Useful context for this document:
 
 Every major RL post-training framework needs the same five rollout primitives from its inference layer: weight synchronization, engine lifecycle management, load-aware routing, asynchronous generation, and partial rollout control. Today each framework builds these as ad-hoc glue code tightly coupled to a specific inference engine and orchestrator.
 
-The llm-d RL rollout infrastructure proposes to extract these five primitives into a Kubernetes-native, framework-agnostic rollout service that any RL training loop can consume. By exposing an HTTP/gRPC control plane with a high-performance NCCL/NIXL data plane for weight transfer, llm-d becomes the neutral infrastructure layer beneath all RL frameworks — replacing what Ray does for inference management while letting frameworks keep Ray for training orchestration.
+The llm-d RL rollout infrastructure proposes to extract these five primitives into a Kubernetes-native, framework-agnostic rollout service that any RL training loop can consume. By exposing an HTTP/gRPC control plane with a high-performance NCCL/NIXL data plane for weight transfer, llm-d becomes the neutral infrastructure layer beneath all RL frameworks, replacing what Ray does for inference management while letting frameworks keep Ray for training orchestration.
 
 This positions vLLM+llm-d as the natural entry point for any lab doing RL post-training, regardless of which framework they choose.
 
@@ -205,7 +205,7 @@ What llm-d provides:
 
 The problem: overlapping generation with training increases GPU utilization, but requires careful coordination of weight versions, staleness bounds, and backpressure.
 
-Current state: every framework has some form of async generation, but implementations differ significantly. SkyRL has the best staleness control (capacity-based bounds from the AReal paper). NeMo-RL tracks weight versions in a replay buffer. OpenRLHF uses token-bucket backpressure.
+Current state: every framework has some form of async generation, but implementations differ significantly. SkyRL has the best staleness control (capacity-based bounds from the [AReal](https://arxiv.org/abs/2505.24298) paper). NeMo-RL tracks weight versions in a replay buffer. OpenRLHF uses token-bucket backpressure.
 
 What llm-d provides:
 
@@ -311,8 +311,6 @@ Why not Ray inside llm-d:
 | **fast-model-actuation** | Sleep/wake lifecycle management for colocated deployments |
 
 The RL rollout infrastructure is not a separate stack — it extends llm-d's existing components with new coordination logic and APIs for the RL use case.
-
----
 
 ## API surface
 

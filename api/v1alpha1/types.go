@@ -172,6 +172,20 @@ type PoolStatus struct {
 	Engines []EngineStatus `json:"engines,omitempty"`
 }
 
+// SleepRequest triggers a sleep across the engine pool.
+type SleepRequest struct {
+	// Level controls GPU memory behavior during sleep.
+	// See SleepLevel constants for valid values.
+	Level int `json:"level"`
+}
+
+// WakeUpRequest triggers a wake-up across the engine pool.
+type WakeUpRequest struct {
+	// Tags specifies which resources to restore.
+	// Valid tags: "weights", "kv_cache"
+	Tags []string `json:"tags"`
+}
+
 // EngineStatus reports the status of a single inference engine.
 type EngineStatus struct {
 	// ID uniquely identifies this engine.

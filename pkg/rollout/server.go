@@ -4,9 +4,11 @@
 package rollout
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 
@@ -66,9 +68,116 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// TODO: Route through inference scheduler (EPP) for KV-cache-aware dispatch.
-	// For now, return a placeholder indicating the generation pipeline is not yet wired.
-	http.Error(w, "generation routing not yet implemented — will integrate with EPP", http.StatusNotImplemented)
+	// Pick a ready engine from the pool.
+	// TODO: Replace with EPP routing for KV-cache-aware dispatch.
+	engine, err := s.pool.PickReadyEngine()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("no engines available: %v", err), http.StatusServiceUnavailable)
+		return
+	}
+
+	// Translate to OpenAI completions format and forward.
+	resp, err := s.forwardToEngine(r.Context(), engine, &req)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("generate: %v", err), http.StatusBadGateway)
+		return
+	}
+
+	s.mu.RLock()
+	resp.WeightVersion = s.weightVersion
+	s.mu.RUnlock()
+	resp.EngineID = engine.ID
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// forwardToEngine translates a GenerateRequest to OpenAI /v1/completions
+// format, forwards it to the engine, and translates the response back.
+func (s *Server) forwardToEngine(ctx context.Context, engine *lifecycle.EngineInfo, req *v1alpha1.GenerateRequest) (*v1alpha1.GenerateResponse, error) {
+	// Build OpenAI completions request.
+	oaiReq := map[string]interface{}{
+		"model":  "default",
+		"prompt": req.PromptTokenIDs,
+	}
+	if req.SamplingParams != nil {
+		sp := req.SamplingParams
+		if sp.Temperature > 0 {
+			oaiReq["temperature"] = sp.Temperature
+		}
+		if sp.TopP > 0 {
+			oaiReq["top_p"] = sp.TopP
+		}
+		if sp.MaxTokens > 0 {
+			oaiReq["max_tokens"] = sp.MaxTokens
+		}
+		if sp.NSamples > 0 {
+			oaiReq["n"] = sp.NSamples
+		}
+		if len(sp.StopStrings) > 0 {
+			oaiReq["stop"] = sp.StopStrings
+		}
+	}
+	if req.ReturnLogprobs {
+		oaiReq["logprobs"] = 1
+	}
+
+	body, err := json.Marshal(oaiReq)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		engine.Address+"/v1/completions", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	httpResp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("POST /v1/completions: %w", err)
+	}
+	defer httpResp.Body.Close()
+
+	respBody, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	if httpResp.StatusCode >= 400 {
+		return nil, fmt.Errorf("engine returned %d: %s", httpResp.StatusCode, string(respBody))
+	}
+
+	// Parse OpenAI completions response.
+	var oaiResp struct {
+		Choices []struct {
+			Text         string `json:"text"`
+			FinishReason string `json:"finish_reason"`
+			Logprobs     *struct {
+				TokenLogprobs []float32 `json:"token_logprobs"`
+				Tokens        []string  `json:"tokens"`
+			} `json:"logprobs"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(respBody, &oaiResp); err != nil {
+		return nil, fmt.Errorf("parse response: %w", err)
+	}
+
+	resp := &v1alpha1.GenerateResponse{}
+	if len(oaiResp.Choices) > 0 {
+		choice := oaiResp.Choices[0]
+		resp.FinishReason = choice.FinishReason
+		// Convert output text to token IDs (simple byte-level fallback).
+		for _, c := range choice.Text {
+			resp.OutputTokenIDs = append(resp.OutputTokenIDs, int32(c))
+		}
+		if choice.Logprobs != nil {
+			resp.Logprobs = choice.Logprobs.TokenLogprobs
+		}
+	}
+
+	return resp, nil
 }
 
 func (s *Server) handleAbortGeneration(w http.ResponseWriter, r *http.Request) {
@@ -134,13 +243,24 @@ func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
 		return
 	}
-	// TODO: Fan out pause to all engines
-	http.Error(w, "not yet implemented", http.StatusNotImplemented)
+
+	if err := s.coordinator.PauseAll(r.Context(), req.Mode); err != nil {
+		http.Error(w, fmt.Sprintf("pause: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "paused"})
 }
 
 func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
-	// TODO: Fan out resume to all engines
-	http.Error(w, "not yet implemented", http.StatusNotImplemented)
+	if err := s.coordinator.ResumeAll(r.Context()); err != nil {
+		http.Error(w, fmt.Sprintf("resume: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "resumed"})
 }
 
 func (s *Server) handleSleep(w http.ResponseWriter, r *http.Request) {
@@ -162,9 +282,7 @@ func (s *Server) handleSleep(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleWakeUp(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Tags []string `json:"tags"`
-	}
+	var req v1alpha1.WakeUpRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
 		return
@@ -190,11 +308,6 @@ func (s *Server) handlePoolStatus(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-}
-
-// SleepRequest is the JSON body for the sleep endpoint.
-type SleepRequest = struct {
-	Level int `json:"level"`
 }
 
 // compile-time check
