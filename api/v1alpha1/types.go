@@ -1,0 +1,194 @@
+// Package v1alpha1 defines the API types for the llm-d RL rollout infrastructure.
+//
+// These types define the contract between RL training frameworks and the llm-d
+// rollout controller. The API is designed to be framework-agnostic — any training
+// loop (veRL, OpenRLHF, SkyRL, NeMo-RL, or custom) can consume it via HTTP/gRPC.
+package v1alpha1
+
+// PauseMode controls how in-flight requests are handled during weight updates.
+type PauseMode string
+
+const (
+	// PauseModeAbort aborts all in-flight requests immediately.
+	// Fastest, but discards partial work.
+	PauseModeAbort PauseMode = "abort"
+
+	// PauseModeWait stops accepting new requests and waits for in-flight
+	// requests to complete before proceeding.
+	PauseModeWait PauseMode = "wait"
+
+	// PauseModeKeep freezes all in-flight requests in place. After the
+	// weight update completes, frozen requests resume from where they left off.
+	// Most efficient but requires vLLM v1+ with PauseMode.KEEP support.
+	PauseModeKeep PauseMode = "keep"
+)
+
+// SleepLevel controls the GPU memory management behavior during sleep.
+type SleepLevel int
+
+const (
+	// SleepLevel0 pauses scheduling only. No GPU memory changes.
+	SleepLevel0 SleepLevel = 0
+
+	// SleepLevel1 offloads model weights to CPU memory. KV cache is discarded.
+	// Good for sleeping and waking with the same model.
+	SleepLevel1 SleepLevel = 1
+
+	// SleepLevel2 discards all GPU memory (weights + KV cache).
+	// Good for weight update scenarios where previous weights are not needed.
+	// Preferred for RL colocated deployments (vLLM >= 0.8.5).
+	SleepLevel2 SleepLevel = 2
+)
+
+// WeightSyncBackend identifies the transport mechanism for weight transfer.
+type WeightSyncBackend string
+
+const (
+	// WeightSyncNCCL uses NCCL collective broadcast for weight transfer.
+	// Works for both colocated and disaggregated deployments.
+	WeightSyncNCCL WeightSyncBackend = "nccl"
+
+	// WeightSyncNIXL uses NIXL/RDMA for high-bandwidth cross-node transfer.
+	WeightSyncNIXL WeightSyncBackend = "nixl"
+
+	// WeightSyncCheckpoint loads weights from a shared filesystem path.
+	WeightSyncCheckpoint WeightSyncBackend = "checkpoint"
+)
+
+// PoolPhase represents the current operational phase of the engine pool.
+type PoolPhase string
+
+const (
+	PoolPhaseServing  PoolPhase = "Serving"
+	PoolPhaseSleeping PoolPhase = "Sleeping"
+	PoolPhaseSyncing  PoolPhase = "Syncing"
+	PoolPhaseRolling  PoolPhase = "Rolling"
+)
+
+// --- Request/Response Types ---
+
+// GenerateRequest is a request to generate token sequences from prompts.
+type GenerateRequest struct {
+	// PromptTokenIDs is the tokenized input prompt.
+	PromptTokenIDs []int32 `json:"prompt_token_ids"`
+
+	// SamplingParams controls generation behavior (temperature, top_p, max_tokens, etc.).
+	SamplingParams *SamplingParams `json:"sampling_params,omitempty"`
+
+	// SessionID enables multi-turn session affinity. Requests with the same
+	// session ID are routed to the same engine for KV cache reuse.
+	SessionID string `json:"session_id,omitempty"`
+
+	// ReturnLogprobs requests per-token log probabilities in the response.
+	ReturnLogprobs bool `json:"return_logprobs,omitempty"`
+
+	// WeightVersion is the expected weight version. If set, the controller
+	// validates that engines are running this version before dispatching.
+	WeightVersion int64 `json:"weight_version,omitempty"`
+}
+
+// GenerateResponse contains the output of a generation request.
+type GenerateResponse struct {
+	// OutputTokenIDs is the generated token sequence.
+	OutputTokenIDs []int32 `json:"output_token_ids"`
+
+	// Logprobs contains per-token log probabilities (if requested).
+	Logprobs []float32 `json:"logprobs,omitempty"`
+
+	// WeightVersion is the weight version of the engine that generated this output.
+	WeightVersion int64 `json:"weight_version"`
+
+	// EngineID identifies which engine served this request.
+	EngineID string `json:"engine_id"`
+
+	// FinishReason indicates why generation stopped.
+	FinishReason string `json:"finish_reason"` // "stop", "length", "abort"
+}
+
+// SamplingParams controls the generation sampling behavior.
+type SamplingParams struct {
+	Temperature    float32 `json:"temperature,omitempty"`
+	TopP           float32 `json:"top_p,omitempty"`
+	TopK           int     `json:"top_k,omitempty"`
+	MaxTokens      int     `json:"max_tokens,omitempty"`
+	NSamples       int     `json:"n,omitempty"`
+	StopStrings    []string `json:"stop,omitempty"`
+}
+
+// WeightTransferInit configures the weight transfer data plane.
+type WeightTransferInit struct {
+	// Backend selects the transport mechanism.
+	Backend WeightSyncBackend `json:"backend"`
+
+	// MasterAddress is the trainer's address for NCCL rendezvous.
+	MasterAddress string `json:"master_address"`
+
+	// MasterPort is the trainer's port for NCCL rendezvous.
+	MasterPort int32 `json:"master_port"`
+
+	// TrainerWorldSize is the number of trainer ranks participating.
+	TrainerWorldSize int32 `json:"trainer_world_size"`
+
+	// Packed enables packed tensor transfer (multiple weights per buffer).
+	Packed bool `json:"packed,omitempty"`
+
+	// IsCheckpointFormat indicates weights are in checkpoint format (e.g., bf16)
+	// and need requantization for the inference kernel (e.g., fp8).
+	IsCheckpointFormat bool `json:"is_checkpoint_format,omitempty"`
+}
+
+// WeightUpdateRequest triggers a weight update across the engine pool.
+type WeightUpdateRequest struct {
+	// TargetVersion is the new weight version after the update.
+	TargetVersion int64 `json:"target_version"`
+
+	// PauseMode controls how in-flight requests are handled.
+	PauseMode PauseMode `json:"pause_mode,omitempty"`
+
+	// ResetKVCache indicates whether to invalidate KV caches after the update.
+	// Should be true for policy weight updates (stale KV cache), false for
+	// LoRA adapter updates (KV cache remains valid).
+	ResetKVCache bool `json:"reset_kv_cache,omitempty"`
+}
+
+// PoolStatus reports the current state of the engine pool.
+type PoolStatus struct {
+	// Phase is the current operational phase.
+	Phase PoolPhase `json:"phase"`
+
+	// TotalEngines is the total number of engines in the pool.
+	TotalEngines int `json:"total_engines"`
+
+	// ReadyEngines is the number of healthy, ready engines.
+	ReadyEngines int `json:"ready_engines"`
+
+	// WeightVersion is the current weight version across the pool.
+	WeightVersion int64 `json:"weight_version"`
+
+	// LastWeightSync is the timestamp of the last successful weight sync.
+	LastWeightSync string `json:"last_weight_sync,omitempty"`
+
+	// Engines contains per-engine status.
+	Engines []EngineStatus `json:"engines,omitempty"`
+}
+
+// EngineStatus reports the status of a single inference engine.
+type EngineStatus struct {
+	// ID uniquely identifies this engine.
+	ID string `json:"id"`
+
+	// Address is the engine's network address (host:port).
+	Address string `json:"address"`
+
+	// Ready indicates whether the engine is healthy and accepting requests.
+	Ready bool `json:"ready"`
+
+	// WeightVersion is this engine's current weight version.
+	WeightVersion int64 `json:"weight_version"`
+
+	// QueueDepth is the number of in-flight requests on this engine.
+	QueueDepth int `json:"queue_depth"`
+
+	// KVCacheUtilization is the fraction of KV cache in use (0.0–1.0).
+	KVCacheUtilization float64 `json:"kv_cache_utilization"`
+}
