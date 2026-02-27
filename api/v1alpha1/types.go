@@ -149,6 +149,15 @@ type WeightUpdateRequest struct {
 	// Should be true for policy weight updates (stale KV cache), false for
 	// LoRA adapter updates (KV cache remains valid).
 	ResetKVCache bool `json:"reset_kv_cache,omitempty"`
+
+	// ParamNames lists the parameter names to update (must match model parameter order).
+	ParamNames []string `json:"param_names,omitempty"`
+
+	// ParamDtypes lists the dtype name for each parameter (e.g., "torch.bfloat16").
+	ParamDtypes []string `json:"param_dtypes,omitempty"`
+
+	// ParamShapes lists the shape of each parameter as a list of ints.
+	ParamShapes [][]int `json:"param_shapes,omitempty"`
 }
 
 // PoolStatus reports the current state of the engine pool.

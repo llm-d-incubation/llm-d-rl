@@ -25,6 +25,7 @@ type Server struct {
 
 	mu            sync.RWMutex
 	weightVersion int64
+	modelName     string // cached model name from engine
 }
 
 // NewServer creates a new rollout controller server.
@@ -92,12 +93,45 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// discoverModelName queries the engine's /v1/models endpoint to get the served model name.
+func (s *Server) discoverModelName(ctx context.Context, engine *lifecycle.EngineInfo) string {
+	s.mu.RLock()
+	name := s.modelName
+	s.mu.RUnlock()
+	if name != "" {
+		return name
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, engine.Address+"/v1/models", nil)
+	if err != nil {
+		return "default"
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "default"
+	}
+	defer resp.Body.Close()
+	var models struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&models); err != nil || len(models.Data) == 0 {
+		return "default"
+	}
+
+	s.mu.Lock()
+	s.modelName = models.Data[0].ID
+	s.mu.Unlock()
+	return models.Data[0].ID
+}
+
 // forwardToEngine translates a GenerateRequest to OpenAI /v1/completions
 // format, forwards it to the engine, and translates the response back.
 func (s *Server) forwardToEngine(ctx context.Context, engine *lifecycle.EngineInfo, req *v1alpha1.GenerateRequest) (*v1alpha1.GenerateResponse, error) {
 	// Build OpenAI completions request.
 	oaiReq := map[string]interface{}{
-		"model":  "default",
+		"model":  s.discoverModelName(ctx, engine),
 		"prompt": req.PromptTokenIDs,
 	}
 	if req.SamplingParams != nil {

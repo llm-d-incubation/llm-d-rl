@@ -121,6 +121,40 @@ python3 examples/slime/grpo_training_loop.py --controller-url http://localhost:8
 python3 examples/verl/ppo_training_loop.py --controller-url http://localhost:8090
 ```
 
+### On a GPU cluster (CoreWeave CKS)
+
+Full end-to-end with real vLLM, real NCCL weight sync, and real GPU memory management.
+
+```bash
+# 1. Build and push the controller image
+export REGISTRY=ghcr.io/youruser
+make docker-build && make docker-push
+
+# 2. Create namespace and HuggingFace token secret
+kubectl apply -f deploy/cks/namespace.yaml
+kubectl create secret generic hf-token \
+  --namespace=llm-d-rl \
+  --from-literal=token=hf_YOUR_TOKEN
+
+# 3. Deploy vLLM engine (wait ~2-5 min for model load)
+kubectl apply -f deploy/cks/vllm-engine.yaml
+kubectl -n llm-d-rl wait --for=condition=ready pod -l app=vllm-engine --timeout=600s
+
+# 4. Deploy rollout controller
+kubectl apply -f deploy/cks/rollout-controller.yaml
+kubectl -n llm-d-rl wait --for=condition=ready pod -l app=rollout-controller --timeout=120s
+
+# 5. Run the NCCL weight trainer
+kubectl apply -f deploy/cks/trainer-job.yaml
+kubectl -n llm-d-rl logs -f job/nccl-trainer
+
+# 6. Verify
+kubectl -n llm-d-rl exec deploy/rollout-controller -- \
+  wget -qO- http://localhost:8090/v1/weights/version
+```
+
+The trainer loads Llama-3.2-1B, perturbs weights (simulating gradient steps), and broadcasts them to vLLM via NCCL. The controller orchestrates the sleep/wake/sync lifecycle. See `deploy/cks/` for the full manifests.
+
 ### CLI flags
 
 ```
@@ -147,12 +181,13 @@ make docker-build   # build container image
 - [Examples](examples/README.md) — Slime/GRPO and veRL/PPO training loop examples
   - [Slime/GRPO](examples/slime/) — GRPO with group-relative advantages (7 phases)
   - [veRL/PPO](examples/verl/) — PPO with critic network and GAE (11 phases)
+- [CKS deployment](deploy/cks/) — Kubernetes manifests for CoreWeave CKS with real NCCL weight sync
 - [North star design](docs/proposals/rl-rollout-northstar.md) — technical specification and framework analysis
 - [Roadmap](docs/proposals/roadmap.md) — multi-phase implementation plan
 
 ## Project status
 
-This project is in early development (Phase 0). The rollout controller runs end-to-end with simulated lifecycle operations. See the [roadmap](docs/proposals/roadmap.md) for what's planned.
+This project is in early development (Phase 0). The rollout controller runs end-to-end with simulated lifecycle operations and has CKS deployment manifests for testing with real vLLM and NCCL weight sync. See the [roadmap](docs/proposals/roadmap.md) for what's planned.
 
 ## License
 

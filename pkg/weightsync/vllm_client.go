@@ -45,22 +45,24 @@ func (c *VLLMClient) Resume(ctx context.Context) error {
 func (c *VLLMClient) InitWeightTransfer(ctx context.Context, init *v1alpha1.WeightTransferInit) error {
 	body := map[string]interface{}{
 		"init_info": map[string]interface{}{
-			"backend":           string(init.Backend),
-			"master_address":    init.MasterAddress,
-			"master_port":       init.MasterPort,
-			"trainer_world_size": init.TrainerWorldSize,
+			"master_address": init.MasterAddress,
+			"master_port":    init.MasterPort,
+			"rank_offset":    1, // trainer is rank 0, engines start at rank 1
+			"world_size":     init.TrainerWorldSize,
 		},
 	}
 	return c.post(ctx, "/init_weight_transfer_engine", body)
 }
 
 func (c *VLLMClient) UpdateWeights(ctx context.Context, req *v1alpha1.WeightUpdateRequest) error {
+	updateInfo := map[string]interface{}{
+		"names":       req.ParamNames,
+		"dtype_names": req.ParamDtypes,
+		"shapes":      req.ParamShapes,
+		"packed":      false,
+	}
 	body := map[string]interface{}{
-		"update_info": map[string]interface{}{
-			"target_version":      req.TargetVersion,
-			"is_checkpoint_format": true,
-			"packed":              true,
-		},
+		"update_info": updateInfo,
 	}
 	return c.post(ctx, "/update_weights", body)
 }
