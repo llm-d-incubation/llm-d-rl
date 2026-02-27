@@ -31,35 +31,27 @@ To define the scope of the RL rollout infrastructure, we use the example of a ty
 
 ```mermaid
 sequenceDiagram
-    box rgb(240,240,255) RL Training Loop (veRL / Slime / SkyRL / OpenRLHF / NeMo-RL)
-        participant TL as Training Loop
-    end
-    box rgb(220,245,220) llm-d Rollout Infrastructure (in scope)
+    participant TL as Training Loop
         participant RC as Rollout Controller
         participant EP as Engine Pool (vLLM)
-    end
 
     Note over TL: 1. Prepare prompt batch from dataset
 
-    rect rgb(200,230,255)
-        Note right of TL: GENERATION (in scope)
-        TL->>RC: 2. Generate(prompts, sampling_params)
+    Note right of TL: GENERATION (in scope)
+    TL->>RC: 2. Generate(prompts, sampling_params)
         RC->>EP: 3. Route via EPP (KV-cache aware)
         EP-->>RC: 4. Generated sequences + logprobs
-        RC-->>TL: 5. Return rollout results
-    end
+    RC-->>TL: 5. Return rollout results
 
     Note over TL: 6. Compute rewards (reward model or function)
     Note over TL: 7. Compute advantages, train policy (gradient update)
 
-    rect rgb(200,230,255)
-        Note right of TL: WEIGHT SYNC (in scope)
-        TL->>RC: 8. UpdateWeights(target_version)
+    Note right of TL: WEIGHT SYNC (in scope)
+    TL->>RC: 8. UpdateWeights(target_version)
         RC->>EP: 9. Pause → transfer → resume
         Note over TL,EP: 10. Weights sent via NCCL/NIXL (GPU-to-GPU)
         EP-->>RC: 11. Engines updated, KV cache reset
-        RC-->>TL: Weight sync complete
-    end
+    RC-->>TL: Weight sync complete
 
     Note over TL: 12. Repeat from step 1
 ```
@@ -131,12 +123,6 @@ flowchart LR
     D --> E["Resume<br/>Generation"]
     E --> F["Update Weight<br/>Version"]
 
-    style A fill:#ffeaea,stroke:#cc6666
-    style B fill:#fff3e0,stroke:#cc9944
-    style C fill:#e8f4e8,stroke:#66aa66
-    style D fill:#fff3e0,stroke:#cc9944
-    style E fill:#e8f0ff,stroke:#6688cc
-    style F fill:#f0f0ff,stroke:#8888cc
 ```
 
 - A **weight sync controller** that orchestrates the full lifecycle: pause generation → establish transfer group → transfer weights → reset KV cache → resume generation
@@ -287,12 +273,6 @@ graph TB
     RC --> EPP
     EPP --> POOL
 
-    style RAY fill:#f0f0ff,stroke:#8888cc,stroke-width:2px
-    style K8S fill:#f0fff0,stroke:#88cc88,stroke-width:2px
-    style RC fill:#e8f4e8,stroke:#66aa66
-    style EPP fill:#e8f0ff,stroke:#6688cc
-    style POOL fill:#fff8e8,stroke:#ccaa44
-    style TL fill:#dde,stroke:#88c
 ```
 
 The **two communication paths** are intentionally separate:
@@ -305,10 +285,6 @@ graph LR
         C -->|"dispatch"| D["vLLM Engines"]
     end
 
-    style A fill:#f0f0ff,stroke:#8888cc
-    style B fill:#e8f4e8,stroke:#66aa66
-    style C fill:#e8f0ff,stroke:#6688cc
-    style D fill:#fff8e8,stroke:#ccaa44
 ```
 
 ```mermaid
@@ -319,10 +295,6 @@ graph LR
         T -->|"direct GPU-to-GPU"| VN["vLLM Worker N"]
     end
 
-    style T fill:#f0f0ff,stroke:#8888cc
-    style V0 fill:#fff8e8,stroke:#ccaa44
-    style V1 fill:#fff8e8,stroke:#ccaa44
-    style VN fill:#fff8e8,stroke:#ccaa44
 ```
 
 **Why this split:**

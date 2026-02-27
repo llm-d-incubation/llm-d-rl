@@ -185,12 +185,6 @@ graph TB
     R4 --> R5
     R3 --> R6
 
-    style R1 fill:#e8f4e8,stroke:#66aa66
-    style R2 fill:#e8f4e8,stroke:#66aa66
-    style R3 fill:#e8f4e8,stroke:#66aa66
-    style R4 fill:#fff3e0,stroke:#cc9944
-    style R5 fill:#fff3e0,stroke:#cc9944
-    style R6 fill:#ffeaea,stroke:#cc6666
 ```
 
 ## Dependencies and Upstream Work
