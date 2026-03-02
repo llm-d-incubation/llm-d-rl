@@ -361,6 +361,11 @@ def main():
         json.dump(results, f, indent=2)
     log.info("Results written to %s", args.output)
 
+    # Print results to stdout with delimiters for reliable extraction from logs
+    print("===BENCH_RESULTS_START===")
+    print(json.dumps(results, indent=2))
+    print("===BENCH_RESULTS_END===")
+
     # === Verify ===
     final_version = client.get_weight_version()
     log.info("Final weight version: controller=%d, expected=%d",

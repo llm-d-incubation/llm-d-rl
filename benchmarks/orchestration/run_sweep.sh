@@ -69,17 +69,17 @@ run_llmd_bench() {
     log "  Waiting for llmd-bench job..."
     kubectl -n "$NAMESPACE" wait --for=condition=complete job/llmd-bench --timeout=1800s
 
-    # Copy results
-    local pod
-    pod=$(kubectl -n "$NAMESPACE" get pods -l app=llmd-bench \
-        --field-selector=status.phase=Succeeded -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-    if [ -n "$pod" ]; then
-        kubectl cp "$NAMESPACE/$pod:/results/llmd_results.json" "$RESULTS_DIR/$output_file"
+    # Extract results from logs (emptyDir volumes are gone after pod completes)
+    log "  Extracting results from job logs..."
+    local logs
+    logs=$(kubectl -n "$NAMESPACE" logs job/llmd-bench)
+    echo "$logs" | sed -n '/===BENCH_RESULTS_START===/,/===BENCH_RESULTS_END===/p' \
+        | grep -v '===BENCH_RESULTS' > "$RESULTS_DIR/$output_file"
+    if [ -s "$RESULTS_DIR/$output_file" ]; then
         log "  Results saved to $RESULTS_DIR/$output_file"
     else
-        log "  WARNING: Could not find completed pod to copy results"
-        # Try to get results from logs
-        kubectl -n "$NAMESPACE" logs job/llmd-bench > "$RESULTS_DIR/llmd_${engines}engines.log"
+        log "  WARNING: Could not extract results, saving full logs"
+        echo "$logs" > "$RESULTS_DIR/llmd_${engines}engines.log"
     fi
 
     kubectl -n "$NAMESPACE" delete job llmd-bench --ignore-not-found=true 2>/dev/null
@@ -106,16 +106,17 @@ run_ray_bench() {
     log "  Waiting for ray-bench job..."
     kubectl -n "$NAMESPACE" wait --for=condition=complete job/ray-bench --timeout=1800s
 
-    # Copy results
-    local pod
-    pod=$(kubectl -n "$NAMESPACE" get pods -l app=ray-bench \
-        --field-selector=status.phase=Succeeded -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-    if [ -n "$pod" ]; then
-        kubectl cp "$NAMESPACE/$pod:/results/ray_results.json" "$RESULTS_DIR/$output_file"
+    # Extract results from logs (emptyDir volumes are gone after pod completes)
+    log "  Extracting results from job logs..."
+    local logs
+    logs=$(kubectl -n "$NAMESPACE" logs job/ray-bench)
+    echo "$logs" | sed -n '/===BENCH_RESULTS_START===/,/===BENCH_RESULTS_END===/p' \
+        | grep -v '===BENCH_RESULTS' > "$RESULTS_DIR/$output_file"
+    if [ -s "$RESULTS_DIR/$output_file" ]; then
         log "  Results saved to $RESULTS_DIR/$output_file"
     else
-        log "  WARNING: Could not find completed pod to copy results"
-        kubectl -n "$NAMESPACE" logs job/ray-bench > "$RESULTS_DIR/ray_${engines}engines.log"
+        log "  WARNING: Could not extract results, saving full logs"
+        echo "$logs" > "$RESULTS_DIR/ray_${engines}engines.log"
     fi
 
     kubectl -n "$NAMESPACE" delete job ray-bench --ignore-not-found=true 2>/dev/null

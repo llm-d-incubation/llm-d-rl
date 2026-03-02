@@ -142,12 +142,13 @@ class VLLMDirectClient:
     def wake_up(self, tags: list[str]) -> dict:
         return self._post("/wake_up", {"tags": tags})
 
-    def init_weight_transfer(self, master_address: str, master_port: int, world_size: int) -> dict:
+    def init_weight_transfer(self, master_address: str, master_port: int,
+                             world_size: int, rank_offset: int = 1) -> dict:
         return self._post("/init_weight_transfer_engine", {
             "init_info": {
                 "master_address": master_address,
                 "master_port": master_port,
-                "rank_offset": 1,
+                "rank_offset": rank_offset,
                 "world_size": world_size,
             },
         })
@@ -239,8 +240,24 @@ def make_ray_trainer_class():
             time.sleep(1)
 
             nccl_init_start = time.perf_counter()
-            for client in self.clients:
-                client.init_weight_transfer(master_address, self.master_port, world_size)
+            # Init all engines concurrently — NCCL group creation blocks until
+            # all ranks join, so serial init would deadlock at 2+ engines.
+            init_threads = []
+            init_errors = []
+            for i, client in enumerate(self.clients):
+                def init_engine(c=client, rank=i+1):
+                    try:
+                        c.init_weight_transfer(master_address, self.master_port,
+                                               world_size, rank_offset=rank)
+                    except Exception as e:
+                        init_errors.append((rank, e))
+                t = threading.Thread(target=init_engine, daemon=True)
+                t.start()
+                init_threads.append(t)
+            for t in init_threads:
+                t.join(timeout=300)
+            if init_errors:
+                raise RuntimeError(f"Engine init failed: {init_errors}")
             nccl_thread.join(timeout=300)
             nccl_init_time = time.perf_counter() - nccl_init_start
 
@@ -415,6 +432,11 @@ def main():
     with open(args.output, "w") as f:
         json.dump(results, f, indent=2)
     log.info("Results written to %s", args.output)
+
+    # Print results to stdout with delimiters for reliable extraction from logs
+    print("===BENCH_RESULTS_START===")
+    print(json.dumps(results, indent=2))
+    print("===BENCH_RESULTS_END===")
 
     ray.shutdown()
 
