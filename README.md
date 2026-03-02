@@ -1,4 +1,4 @@
-# llm-d-rl
+# llm-d-RL
 
 Framework-agnostic RL rollout infrastructure for the [llm-d](https://github.com/llm-d) inference serving stack.
 
