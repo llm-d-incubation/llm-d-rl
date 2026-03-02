@@ -28,7 +28,8 @@ spec:
       labels:
         app: vllm-engine
     spec:
-      schedulerName: custom-binpack-scheduler
+      nodeSelector:
+        kubernetes.io/hostname: gc3a4f4
       containers:
         - name: vllm
           image: vllm/vllm-openai:latest
@@ -49,6 +50,8 @@ spec:
               value: "IB"
             - name: NCCL_DEBUG
               value: "INFO"
+            - name: NCCL_IB_HCA
+              value: "ibp"
           command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
           args:
             - "--model"
@@ -65,8 +68,10 @@ spec:
           resources:
             limits:
               nvidia.com/gpu: "1"
+              rdma/ib: "1"
             requests:
               nvidia.com/gpu: "1"
+              rdma/ib: "1"
               memory: "32Gi"
               cpu: "4"
           readinessProbe:

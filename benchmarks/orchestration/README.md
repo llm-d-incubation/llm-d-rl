@@ -237,8 +237,28 @@ With IB enabled, NCCL broadcast should drop from ~7-8s to sub-1s at 4 engines. A
 | `results/ray_*.json` | Ray results at 1/2/4 engine scales |
 | `charts/*.png` | Generated visualization charts |
 
+## InfiniBand Results (4 Engines, Same Node)
+
+With all pods co-located on a single H200 node using `nodeSelector` and NCCL configured for IB (`NCCL_IB_DISABLE=0`, `NCCL_NET=IB`, `NCCL_IB_HCA=ibp`, `rdma/ib: 1`):
+
+| Metric | TCP (4 engines) | IB (4 engines) | Improvement |
+|--------|----------------|----------------|-------------|
+| Median step time | 8.106s | **0.988s** | **8.2x** |
+| Median NCCL broadcast | 7.399s | **0.337s** | **22x** |
+| NCCL % of step | 91% | **34%** | - |
+| Orchestration overhead | 589ms | **527ms** | same |
+| Effective throughput | 2.2 GB/s | **47.8 GB/s** | **22x** |
+
+NCCL logs confirmed IB transport: `NET/IB : Using [0]ibp0:1/IB ... [7]ibp7:1/IB` with GPU Direct RDMA (`GDRDMA`).
+
+With IB, NCCL is no longer the bottleneck. Orchestration overhead (sleep/wake lifecycle, HTTP coordination) is now **53%** of step time. The next optimization target is vLLM's GPU memory management during sleep/wake transitions.
+
+**Ray IB**: The Ray benchmark failed to complete NCCL IB initialization — the NCCL bootstrap's internal socket connections got "Connection refused" in the Ray actor environment. This appears to be a Ray-specific interaction with NCCL's IB bootstrap, not present in the llm-d-rl (direct process) case. TCP results showed identical orchestration overhead between systems, so the IB comparison would not change the control plane findings.
+
 ## Remaining Work
 
-- [ ] Test with InfiniBand enabled (`NCCL_IB_DISABLE=0`) — IB hardware is present on the CKS nodes
+- [x] ~~Test with InfiniBand enabled~~ — llm-d-rl achieves 22x NCCL speedup with IB
+- [ ] Investigate Ray + NCCL IB bootstrap failure
 - [ ] Benchmark with NIXL backend (alternative to NCCL)
 - [ ] Measure end-to-end veRL integration performance
+- [ ] Optimize vLLM sleep/wake lifecycle (now 53% of step time with IB)

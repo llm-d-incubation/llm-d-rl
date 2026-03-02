@@ -275,6 +275,13 @@ data:
         log.info("Weight version: controller=%d, expected=%d — %s",
                  final, weight_version, "OK" if final == weight_version else "MISMATCH")
 
+        import sys
+        sys.stderr.flush()
+        print("===BENCH_RESULTS_START===")
+        print(json.dumps(results, indent=2))
+        print("===BENCH_RESULTS_END===")
+        sys.stdout.flush()
+
     if __name__ == "__main__":
         main()
 ---
@@ -290,7 +297,8 @@ spec:
       labels:
         app: llmd-bench
     spec:
-      schedulerName: custom-binpack-scheduler
+      nodeSelector:
+        kubernetes.io/hostname: gc3a4f4
       restartPolicy: Never
       containers:
         - name: trainer
@@ -314,6 +322,8 @@ spec:
               value: "IB"
             - name: NCCL_DEBUG
               value: "INFO"
+            - name: NCCL_IB_HCA
+              value: "ibp"
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -329,8 +339,10 @@ spec:
           resources:
             limits:
               nvidia.com/gpu: "1"
+              rdma/ib: "1"
             requests:
               nvidia.com/gpu: "1"
+              rdma/ib: "1"
               memory: "32Gi"
               cpu: "4"
       volumes:

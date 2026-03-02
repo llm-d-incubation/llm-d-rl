@@ -178,11 +178,26 @@ data:
 
                 nccl_thread = threading.Thread(target=create_nccl, daemon=True)
                 nccl_thread.start()
-                time.sleep(1)
+                time.sleep(5)  # IB transport needs more init time than TCP
 
                 nccl_init_start = time.perf_counter()
+                # init_weight_transfer calls must be concurrent — NCCL group
+                # create blocks until all ranks connect.
+                init_threads = []
+                init_errors = []
+                def do_init(c=None):
+                    try:
+                        c.init_weight_transfer(master_address, self.master_port, world_size)
+                    except Exception as e:
+                        init_errors.append(e)
                 for client in self.clients:
-                    client.init_weight_transfer(master_address, self.master_port, world_size)
+                    it = threading.Thread(target=do_init, kwargs={"c": client}, daemon=True)
+                    it.start()
+                    init_threads.append(it)
+                for it in init_threads:
+                    it.join(timeout=300)
+                if init_errors:
+                    raise RuntimeError(f"init_weight_transfer failed: {init_errors}")
                 nccl_thread.join(timeout=300)
                 nccl_init_time = time.perf_counter() - nccl_init_start
 
@@ -230,9 +245,24 @@ data:
 
                 bt = threading.Thread(target=do_broadcast, daemon=True)
                 bt.start()
-                with timed("update_weights_http", t):
-                    for c in self.clients:
+                # update_weights calls must be concurrent — NCCL broadcast is a
+                # collective that requires all ranks to participate simultaneously.
+                update_errors = []
+                def do_update(c=None):
+                    try:
                         c.update_weights(self.model)
+                    except Exception as e:
+                        update_errors.append(e)
+                with timed("update_weights_http", t):
+                    update_threads = []
+                    for client in self.clients:
+                        ut = threading.Thread(target=do_update, kwargs={"c": client}, daemon=True)
+                        ut.start()
+                        update_threads.append(ut)
+                    for ut in update_threads:
+                        ut.join(timeout=120)
+                    if update_errors:
+                        raise RuntimeError(f"update_weights failed: {update_errors}")
                 bt.join(timeout=120)
                 if broadcast_error[0]:
                     raise RuntimeError(f"NCCL failed: {broadcast_error[0]}")
@@ -318,6 +348,14 @@ data:
         with open(args.output, "w") as f:
             json.dump(results, f, indent=2)
         log.info("Results written to %s", args.output)
+
+        import sys
+        sys.stderr.flush()
+        print("===BENCH_RESULTS_START===")
+        print(json.dumps(results, indent=2))
+        print("===BENCH_RESULTS_END===")
+        sys.stdout.flush()
+
         ray.shutdown()
 
     if __name__ == "__main__":
@@ -335,7 +373,8 @@ spec:
       labels:
         app: ray-bench
     spec:
-      schedulerName: custom-binpack-scheduler
+      nodeSelector:
+        kubernetes.io/hostname: gc3a4f4
       restartPolicy: Never
       containers:
         - name: trainer
@@ -358,6 +397,8 @@ spec:
               value: "IB"
             - name: NCCL_DEBUG
               value: "INFO"
+            - name: NCCL_IB_HCA
+              value: "ibp"
             - name: ENGINE_URLS
               value: "http://vllm-engine-0.vllm-engine.llm-d-rl.svc.cluster.local:8000"
             - name: HF_TOKEN
@@ -375,8 +416,10 @@ spec:
           resources:
             limits:
               nvidia.com/gpu: "1"
+              rdma/ib: "1"
             requests:
               nvidia.com/gpu: "1"
+              rdma/ib: "1"
               memory: "32Gi"
               cpu: "4"
       volumes:
