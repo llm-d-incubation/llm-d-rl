@@ -2,9 +2,11 @@
 
 ## TL;DR
 
-On CoreWeave CKS with NVIDIA H200 GPUs, NCCL weight broadcast dominates RL training step time at **80-91%** of wall-clock time. Orchestration overhead (control plane coordination) is **~520-600ms** regardless of system or engine count. **The bottleneck is the data plane (NCCL over TCP sockets), not the control plane.**
+This benchmark validates that llm-d-rl's Go-based rollout controller works correctly at multi-engine scale and establishes a TCP baseline for comparison with InfiniBand.
 
-At all scales (1, 2, 4 engines), orchestration overhead is within 3% between systems. At 4 engines, llm-d-rl is 12% faster overall due to better NCCL throughput. The real optimization opportunity is NCCL transport (InfiniBand, NVLink, NIXL), not the orchestration layer.
+On CoreWeave CKS with NVIDIA H200 GPUs using **TCP sockets** (InfiniBand not yet enabled), NCCL weight broadcast accounts for **80-91%** of step time, as expected for 16.1 GB transfers over TCP. Orchestration overhead is **~520-600ms** for both systems — confirming the control plane is not a differentiator at this transport speed.
+
+The main outcomes are: (1) three multi-engine NCCL deadlocks were discovered and fixed, (2) the TCP baseline quantifies where time is spent for comparison with IB, and (3) llm-d-rl is validated as functionally correct across 1/2/4 engine configurations.
 
 ## Results
 
@@ -196,27 +198,31 @@ Running multi-engine benchmarks exposed critical bugs:
 
 ## Interpretation
 
-These results answer the central question: **does the orchestration layer matter for RL training step latency?** The answer is no — not at current scale, and not with TCP-based NCCL transport.
+These TCP results confirm what theory predicts: transferring 16.1 GB over TCP sockets is slow, and two systems making the same HTTP calls have similar overhead. The value of this benchmark is not in the headline finding but in the details.
 
-**The control plane is not the bottleneck.** Both Go (llm-d-rl) and Python/Ray add ~520-600ms of orchestration overhead per step, dominated by vLLM's GPU memory management during sleep/wake transitions. HTTP round-trip latency, serialization, and coordinator logic are negligible by comparison. Rewriting the control plane in a faster language or framework would save at most a few milliseconds per step.
+**What we learned that wasn't obvious:**
 
-**The data plane is the bottleneck.** NCCL weight broadcast over TCP sockets consumes 80-91% of every training step. At 4 engines, the trainer sends 16.1 GB to each engine sequentially over TCP (NCCL falls back to point-to-point sends without RDMA). This takes ~7-8 seconds. With InfiniBand (200+ Gbps), NCCL can use tree/ring algorithms that distribute the broadcast work across ranks, which should reduce this to sub-1 second.
+1. **Three NCCL deadlocks** at multi-engine scale — sequential `init_weight_transfer`, hardcoded rank offsets, and sequential `update_weights` all caused hangs. These bugs existed in both the Go coordinator and the Ray harness and required concurrent fan-out fixes.
 
-**Scaling behavior is predictable.** Step time increases roughly linearly from 1 to 2 engines (TCP broadcast doubles), then plateaus at 4 engines. The 2-engine anomaly (llm-d-rl slower than Ray) is a network condition artifact — orchestration overhead at that scale differs by only 14ms. The consistent 520-600ms overhead across all configurations demonstrates that the Go coordinator fans out HTTP calls correctly.
+2. **Orchestration overhead is 520-600ms, dominated by vLLM sleep/wake** — not HTTP round-trips or coordinator logic. This means that once NCCL is fast (with IB), the next optimization target is vLLM's GPU memory management, not the control plane language or framework.
 
-**Where to invest next.** The charts make the priority clear: enabling InfiniBand transport would yield a 4-12x improvement in NCCL throughput, reducing the ~8s broadcast at 4 engines to potentially under 1s. This would make orchestration overhead a larger percentage of step time (~30-50%), at which point optimizing the sleep/wake lifecycle becomes worthwhile. NIXL (NVIDIA's new transfer library) is another option that could bypass NCCL's TCP limitations.
+3. **The 2-engine NCCL anomaly** (llm-d-rl 7.2s vs Ray 4.9s) shows that TCP NCCL throughput varies significantly with network conditions, even on the same cluster. This variance should disappear with InfiniBand's dedicated RDMA paths.
+
+**What this baseline enables:**
+
+With IB enabled, NCCL broadcast should drop from ~7-8s to sub-1s at 4 engines. At that point, orchestration overhead becomes 30-50% of step time instead of 9%, and differences between control planes may become measurable. The TCP baseline gives us the "before" for that comparison.
 
 ## Key Takeaways
 
-1. **NCCL transport is the bottleneck, not orchestration.** At 80-91% of step time, optimizing the data plane (InfiniBand, NVLink, NIXL) would yield 5-10x more improvement than any control plane optimization.
+1. **TCP baseline established.** NCCL over TCP sockets takes 2.6-8.3s for 16.1 GB (2-6 GB/s effective throughput). This is the expected performance for TCP and provides the comparison point for InfiniBand runs.
 
-2. **Go and Ray add identical orchestration overhead.** At ~520-600ms per step, the control plane cost is the same regardless of implementation language or framework. This overhead is dominated by vLLM's sleep/wake lifecycle (GPU memory management), not HTTP round-trips.
+2. **Orchestration overhead is identical between systems.** At ~520-600ms per step, Go and Ray add the same control plane cost. This overhead is dominated by vLLM's sleep/wake GPU memory management, not the coordinator implementation.
 
-3. **Orchestration overhead scales flat.** Adding engines doesn't increase control plane latency because the coordinator fans out calls concurrently. NCCL broadcast time increases with engine count over TCP sockets.
+3. **All NCCL operations are collectives that require concurrent fan-out.** Both `init_weight_transfer` and `update_weights` must be called on all engines concurrently — sequential calls deadlock because NCCL barriers require all ranks. This was the most operationally important finding.
 
-4. **All NCCL operations are collectives that require concurrent fan-out.** Both `init_weight_transfer` and `update_weights` must be called on all engines concurrently — sequential calls deadlock because NCCL barriers require all ranks.
+4. **llm-d-rl validated at multi-engine scale.** All configurations maintained correct weight versioning (monotonically increasing, no gaps) across 20 measured steps. The Go coordinator correctly handles concurrent NCCL lifecycle management.
 
-5. **The value proposition of llm-d-rl is simplicity.** Both systems perform equally, but llm-d-rl uses 0 GPUs for coordination (vs Ray's 1 GPU), ~8x less memory, and has no Python/Ray dependency chain. For Kubernetes-native deployments, this is a meaningful operational advantage.
+5. **llm-d-rl uses 0 GPUs for coordination** (vs Ray's 1 GPU), ~8x less memory, and has no Python/Ray dependency chain. Performance is identical, but operational footprint is smaller.
 
 ## Files
 

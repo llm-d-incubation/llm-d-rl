@@ -290,6 +290,7 @@ spec:
       labels:
         app: llmd-bench
     spec:
+      schedulerName: custom-binpack-scheduler
       restartPolicy: Never
       containers:
         - name: trainer

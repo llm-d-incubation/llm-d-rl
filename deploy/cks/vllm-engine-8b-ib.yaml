@@ -28,6 +28,7 @@ spec:
       labels:
         app: vllm-engine
     spec:
+      schedulerName: custom-binpack-scheduler
       containers:
         - name: vllm
           image: vllm/vllm-openai:latest
