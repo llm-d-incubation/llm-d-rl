@@ -35,7 +35,8 @@ type EngineClient interface {
 	Resume(ctx context.Context) error
 
 	// InitWeightTransfer initializes the weight transfer data plane.
-	InitWeightTransfer(ctx context.Context, init *v1alpha1.WeightTransferInit) error
+	// rankOffset is this engine's rank in the NCCL group (trainer is rank 0).
+	InitWeightTransfer(ctx context.Context, init *v1alpha1.WeightTransferInit, rankOffset int32) error
 
 	// UpdateWeights triggers weight reception on this engine.
 	UpdateWeights(ctx context.Context, req *v1alpha1.WeightUpdateRequest) error
@@ -87,14 +88,37 @@ func (c *Coordinator) UnregisterEngine(id string) {
 }
 
 // InitTransfer initializes the weight transfer data plane on all engines.
+// All engines must join the NCCL group concurrently (each blocks until
+// every rank has connected), so we fan out in parallel. Each engine gets
+// a unique rank offset (trainer is rank 0, engines start at rank 1).
 func (c *Coordinator) InitTransfer(ctx context.Context, init *v1alpha1.WeightTransferInit) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	var (
+		wg   sync.WaitGroup
+		errs = make([]error, 0)
+		mu   sync.Mutex
+	)
+
+	rankOffset := int32(1) // trainer is rank 0, engines start at 1
 	for id, engine := range c.engines {
-		if err := engine.InitWeightTransfer(ctx, init); err != nil {
-			return fmt.Errorf("init weight transfer on engine %s: %w", id, err)
-		}
+		wg.Add(1)
+		go func(id string, e EngineClient, offset int32) {
+			defer wg.Done()
+			if err := e.InitWeightTransfer(ctx, init, offset); err != nil {
+				mu.Lock()
+				errs = append(errs, fmt.Errorf("engine %s: %w", id, err))
+				mu.Unlock()
+			}
+		}(id, engine, rankOffset)
+		rankOffset++
+	}
+
+	wg.Wait()
+
+	if len(errs) > 0 {
+		return fmt.Errorf("init weight transfer: %d engine(s) failed: %v", len(errs), errs)
 	}
 
 	c.transferInited = true

@@ -42,12 +42,12 @@ func (c *VLLMClient) Resume(ctx context.Context) error {
 	return c.post(ctx, "/resume", nil)
 }
 
-func (c *VLLMClient) InitWeightTransfer(ctx context.Context, init *v1alpha1.WeightTransferInit) error {
+func (c *VLLMClient) InitWeightTransfer(ctx context.Context, init *v1alpha1.WeightTransferInit, rankOffset int32) error {
 	body := map[string]interface{}{
 		"init_info": map[string]interface{}{
 			"master_address": init.MasterAddress,
 			"master_port":    init.MasterPort,
-			"rank_offset":    1, // trainer is rank 0, engines start at rank 1
+			"rank_offset":    rankOffset,
 			"world_size":     init.TrainerWorldSize,
 		},
 	}

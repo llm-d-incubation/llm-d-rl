@@ -58,8 +58,8 @@ func (c *SimulatedEngineClient) Resume(_ context.Context) error {
 	return nil
 }
 
-func (c *SimulatedEngineClient) InitWeightTransfer(_ context.Context, init *v1alpha1.WeightTransferInit) error {
-	log.Printf("[simulated] engine %s: init weight transfer (backend=%s)", c.baseURL, init.Backend)
+func (c *SimulatedEngineClient) InitWeightTransfer(_ context.Context, init *v1alpha1.WeightTransferInit, rankOffset int32) error {
+	log.Printf("[simulated] engine %s: init weight transfer (backend=%s, rank=%d)", c.baseURL, init.Backend, rankOffset)
 	return nil
 }
 
