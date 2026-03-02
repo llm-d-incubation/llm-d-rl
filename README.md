@@ -185,9 +185,7 @@ make docker-build   # build container image
 - [North star design](docs/proposals/rl-rollout-northstar.md) — technical specification and framework analysis
 - [Roadmap](docs/proposals/roadmap.md) — multi-phase implementation plan
 
-## Project status
-
-This project is in early development (Phase 0). The rollout controller runs end-to-end with simulated lifecycle operations and has CKS deployment manifests for testing with real vLLM and NCCL weight sync. See the [roadmap](docs/proposals/roadmap.md) for what's planned.
+This is an experimentation project. The rollout controller runs end-to-end with simulated lifecycle operations and has deployment manifests for testing with real vLLM and NCCL weight sync. 
 
 ## License
 
