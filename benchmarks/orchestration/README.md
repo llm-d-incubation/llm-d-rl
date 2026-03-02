@@ -1,57 +1,54 @@
 # Weight Sync Validation
 
-Validates that llm-d-rl's Go rollout controller can orchestrate multi-engine NCCL weight sync correctly and at speed.
+## Why a Control Plane Matters
 
-**Result**: On CoreWeave CKS with 4 H200-backed vLLM engines on one node, a full weight sync cycle (sleep, broadcast 16.1 GB via NCCL over InfiniBand, wake) completes in **under 1 second** using **0 GPUs** for coordination.
+In RL training with disaggregated inference, the trainer must sync updated weights to all vLLM engines after every gradient step. This involves a precise multi-phase lifecycle (sleep engines to free GPU memory, broadcast weights via NCCL, wake engines, restore KV cache) and every phase has ordering constraints that are easy to get wrong at multi-engine scale.
 
-| Metric | TCP | InfiniBand |
-|--------|-----|------------|
-| Step time (4 engines) | 8.1s | **0.99s** |
-| NCCL broadcast (16.1 GB) | 7.4s | **0.34s** |
-| Effective throughput | 2.2 GB/s | **47.8 GB/s** |
-| Orchestration overhead | 589ms | **527ms** |
+Without a control plane, every RL framework has to implement this lifecycle itself: manage NCCL group creation with correct rank assignments, ensure concurrent fan-out for collective operations, handle sleep/wake sequencing, and track weight versions. Getting any of these wrong causes silent hangs or deadlocks (see [Bugs Found](#bugs-found)).
 
-## What We Validated
+llm-d-rl's rollout controller handles all of this behind an HTTP API. The trainer calls `POST /v1/weights/update` and the controller does the rest, correctly, concurrently, and without consuming any GPUs for coordination.
 
-Each weight sync step runs 6 phases:
+## Validation Results
 
-1. **Generate** — rollout via vLLM `/v1/completions`
-2. **Sleep** — free GPU memory on engines
-3. **Train** — update model weights
-4. **Broadcast** — NCCL transfer of full model to all engines
-5. **Wake** — restore engine memory and KV cache
-6. **Resume** — engines resume serving
+We validated the controller at 1, 2, and 4 engine scales on CKS with NVIDIA H200 GPUs, running Llama-3.1-8B-Instruct (16.1 GB at bf16).
 
-We ran this at 1, 2, and 4 engine scales (5 warmup + 20 measured steps each). All runs maintained strictly monotonic weight versions with no gaps, missed updates, or ordering errors.
+**4 engines, InfiniBand, same node:**
 
-As a sanity check, we ran the same workload through a Ray-based harness that calls the same vLLM endpoints with the same NCCL code path. Orchestration overhead was identical (~520-600ms) across both systems at every scale — confirming the controller adds no meaningful cost. The overhead is dominated by vLLM's sleep/wake GPU memory management, not HTTP round-trips or coordinator logic.
+| Metric | Result |
+|--------|--------|
+| Full weight sync cycle | **0.99s** |
+| NCCL broadcast (16.1 GB) | 0.34s (47.8 GB/s) |
+| Orchestration overhead | 0.53s |
+| GPUs used for coordination | **0** |
+| Weight version correctness | 20/20 steps, no gaps |
+
+**Orchestration overhead** (everything except generate, train, and NCCL broadcast) is ~527ms per step. This is dominated by vLLM's internal GPU memory management during sleep/wake — not HTTP round-trips or controller logic. We confirmed this by running an equivalent Ray-based harness that calls the same vLLM endpoints: orchestration overhead was identical (~520-600ms) at every scale.
+
+<p align="center"><img src="charts/orchestration_overhead.png" width="75%"></p>
 
 ## Bugs Found
 
-Running at multi-engine scale exposed three NCCL deadlocks that affect anyone using vLLM's weight transfer API:
+Running at multi-engine scale exposed three deadlock patterns in vLLM's weight transfer API. These affect any system orchestrating NCCL weight sync — the controller now handles all of them correctly.
 
-1. **Sequential NCCL init.** `init_weight_transfer_engine` must be called on all engines concurrently — NCCL blocks until all ranks connect. Sequential calls hang on the first engine.
+1. **NCCL init requires concurrent fan-out.** `init_weight_transfer_engine` must be called on all engines simultaneously. NCCL's `StatelessProcessGroup.create()` blocks until all ranks connect — sequential calls hang on the first engine.
 
-2. **Hardcoded rank offset.** All engines were assigned `rank_offset=1`, causing rank collisions at 2+ engines. Fix: incrementing offsets (trainer=0, engine-0=1, engine-1=2, ...).
+2. **Rank offsets must be unique.** Assigning all engines `rank_offset=1` causes rank collisions at 2+ engines. The controller assigns incrementing offsets (trainer=0, engine-0=1, engine-1=2, ...).
 
-3. **Sequential update_weights.** `POST /update_weights` blocks during NCCL receive. At 2+ engines, sequential calls deadlock because the collective never completes. Fix: concurrent HTTP calls.
+3. **update_weights requires concurrent fan-out.** `POST /update_weights` blocks during NCCL receive. Sequential calls at 2+ engines deadlock because the collective never forms.
 
 ## Where Time Goes
 
 <p align="center"><img src="charts/step_breakdown.png" width="75%"></p>
 
-Over TCP, NCCL broadcast accounts for 80-91% of step time — everything else is noise. With InfiniBand, NCCL drops to 34% and orchestration overhead (sleep/wake lifecycle) becomes the dominant cost at 53%.
+With InfiniBand, NCCL broadcast takes 0.34s — fast enough that orchestration overhead (sleep/wake lifecycle) becomes the dominant cost at 53% of step time. The next optimization target is vLLM's GPU memory management during these transitions.
 
-<p align="center"><img src="charts/orchestration_overhead.png" width="75%"></p>
-
-Orchestration overhead stays flat at ~520-600ms regardless of engine count or transport. This is almost entirely vLLM's GPU memory management during sleep/wake — the next optimization target.
-
-## Hardware
+## Setup
 
 - **Cluster**: CoreWeave CKS, NVIDIA H200 (143 GB VRAM), 8 GPUs/node
 - **Model**: Llama-3.1-8B-Instruct (8.03B params, 16.1 GB bf16)
-- **IB config**: `NCCL_NET=IB`, `NCCL_IB_HCA=ibp`, `rdma/ib: 1`, GPU Direct RDMA
+- **Transport**: NCCL over InfiniBand with GPU Direct RDMA
 - **vLLM**: v0.16.0, dev mode, enforce eager, max model len 2048
+- **Protocol**: 5 warmup + 20 measured steps, wall-clock timing per phase
 
 ## Remaining Work
 
@@ -59,10 +56,10 @@ Orchestration overhead stays flat at ~520-600ms regardless of engine count or tr
 - [ ] Benchmark with NIXL backend
 - [ ] End-to-end veRL integration
 
-## Appendix
-
 <details>
-<summary>TCP scaling data (llm-d-rl vs Ray sanity check)</summary>
+<summary>Appendix: TCP baseline and Ray comparison</summary>
+
+We also ran the full sweep over TCP sockets as a baseline, and compared against a Ray-based harness that calls the same vLLM endpoints with the same NCCL code path.
 
 | Engines | llm-d-rl step | Ray step | Orch. overhead (llm-d-rl / Ray) |
 |---------|---------------|----------|---------------------------------|
@@ -70,12 +67,9 @@ Orchestration overhead stays flat at ~520-600ms regardless of engine count or tr
 | 2 | 7.905s | 5.587s | 558ms / 544ms |
 | 4 | 8.106s | 9.066s | 589ms / 604ms |
 
-Step time differences at 2-4 engines reflect TCP network conditions during the runs (different times/nodes), not systemic control plane differences. Orchestration overhead is within 15ms at every scale.
+Over TCP, NCCL dominates step time (80-91%), making orchestration overhead hard to distinguish. Step time differences at 2-4 engines reflect network conditions during the runs, not control plane differences — orchestration overhead is within 15ms at every scale.
 
-</details>
-
-<details>
-<summary>Charts</summary>
+The Ray harness failed to complete NCCL IB initialization due to a Ray actor interaction with NCCL's IB bootstrap. TCP results confirmed identical orchestration overhead between systems.
 
 <p align="center"><img src="charts/step_time_scaling.png" width="75%"></p>
 <p align="center"><img src="charts/nccl_dominance.png" width="75%"></p>
@@ -85,14 +79,7 @@ Step time differences at 2-4 engines reflect TCP network conditions during the r
 </details>
 
 <details>
-<summary>Ray + InfiniBand</summary>
-
-The Ray harness failed to complete NCCL IB initialization — NCCL bootstrap socket connections got "Connection refused" in the Ray actor environment. This appears to be a Ray-specific interaction with NCCL's IB bootstrap. TCP results showed identical orchestration overhead, so the IB comparison would not change conclusions.
-
-</details>
-
-<details>
-<summary>Files</summary>
+<summary>Appendix: Files</summary>
 
 | File | Purpose |
 |------|---------|
