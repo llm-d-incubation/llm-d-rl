@@ -317,9 +317,27 @@ def make_ray_trainer_class():
             broadcast_thread = threading.Thread(target=do_broadcast, daemon=True)
             broadcast_thread.start()
 
+            # update_weights calls must be concurrent — NCCL broadcast is a
+            # collective that requires all ranks to participate simultaneously.
+            # Sequential calls deadlock at 2+ engines.
+            update_errors = []
+
+            def do_update(c=None):
+                try:
+                    c.update_weights(self.model)
+                except Exception as e:
+                    update_errors.append(e)
+
             with timed("update_weights_http", t):
+                update_threads = []
                 for client in self.clients:
-                    client.update_weights(self.model)
+                    ut = threading.Thread(target=do_update, kwargs={"c": client}, daemon=True)
+                    ut.start()
+                    update_threads.append(ut)
+                for ut in update_threads:
+                    ut.join(timeout=120)
+                if update_errors:
+                    raise RuntimeError(f"update_weights failed: {update_errors}")
 
             broadcast_thread.join(timeout=120)
             if broadcast_error[0]:

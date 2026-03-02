@@ -246,9 +246,24 @@ data:
 
                 bt = threading.Thread(target=do_broadcast, daemon=True)
                 bt.start()
-                with timed("update_weights_http", t):
-                    for c in self.clients:
+                # update_weights calls must be concurrent — NCCL broadcast is a
+                # collective requiring all ranks. Sequential calls deadlock at 2+ engines.
+                update_errors = []
+                def do_update(c=None):
+                    try:
                         c.update_weights(self.model)
+                    except Exception as e:
+                        update_errors.append(e)
+                with timed("update_weights_http", t):
+                    update_threads = []
+                    for c in self.clients:
+                        ut = threading.Thread(target=do_update, kwargs={"c": c}, daemon=True)
+                        ut.start()
+                        update_threads.append(ut)
+                    for ut in update_threads:
+                        ut.join(timeout=120)
+                    if update_errors:
+                        raise RuntimeError(f"update_weights failed: {update_errors}")
                 bt.join(timeout=120)
                 if broadcast_error[0]:
                     raise RuntimeError(f"NCCL failed: {broadcast_error[0]}")

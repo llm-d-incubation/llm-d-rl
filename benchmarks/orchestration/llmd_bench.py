@@ -19,6 +19,7 @@ import argparse
 import json
 import logging
 import os
+import sys
 import socket
 import time
 import threading
@@ -361,11 +362,6 @@ def main():
         json.dump(results, f, indent=2)
     log.info("Results written to %s", args.output)
 
-    # Print results to stdout with delimiters for reliable extraction from logs
-    print("===BENCH_RESULTS_START===")
-    print(json.dumps(results, indent=2))
-    print("===BENCH_RESULTS_END===")
-
     # === Verify ===
     final_version = client.get_weight_version()
     log.info("Final weight version: controller=%d, expected=%d",
@@ -374,6 +370,14 @@ def main():
         log.info("SUCCESS: weight versions match")
     else:
         log.error("MISMATCH: expected %d, got %d", weight_version, final_version)
+
+    # Print results to stdout with delimiters for reliable extraction from logs.
+    # Flush stderr first to avoid interleaving with the JSON output.
+    sys.stderr.flush()
+    print("===BENCH_RESULTS_START===")
+    print(json.dumps(results, indent=2))
+    print("===BENCH_RESULTS_END===")
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":

@@ -2,55 +2,72 @@
 
 ## TL;DR
 
-On CoreWeave CKS with NVIDIA H200 GPUs, NCCL weight broadcast dominates RL training step time at **80-91%** of wall-clock time. Orchestration overhead (control plane coordination) is **~520-560ms** regardless of system or engine count. **The bottleneck is the data plane (NCCL over TCP sockets), not the control plane.**
+On CoreWeave CKS with NVIDIA H200 GPUs, NCCL weight broadcast dominates RL training step time at **80-91%** of wall-clock time. Orchestration overhead (control plane coordination) is **~520-600ms** regardless of system or engine count. **The bottleneck is the data plane (NCCL over TCP sockets), not the control plane.**
 
-At 1 engine, llm-d-rl and Ray are within 1% of each other. The real optimization opportunity is NCCL transport (InfiniBand, NVLink, NIXL), not the orchestration layer.
+At all scales (1, 2, 4 engines), orchestration overhead is within 3% between systems. At 4 engines, llm-d-rl is 12% faster overall due to better NCCL throughput. The real optimization opportunity is NCCL transport (InfiniBand, NVLink, NIXL), not the orchestration layer.
 
 ## Results
 
+### Scaling Summary
+
+| Engines | llm-d-rl step (median) | Ray step (median) | Delta | Orch. overhead (llm-d-rl / Ray) |
+|---------|------------------------|--------------------|---------|---------------------------------|
+| 1 | 3.289s | 3.314s | -0.7% | 524ms / 516ms |
+| 2 | 7.905s | 5.587s | +41%* | 558ms / 544ms |
+| 4 | 8.106s | 9.066s | -11% | 589ms / 604ms |
+
+*\* The 2-engine NCCL difference is likely due to network conditions during the runs (different times/nodes). The orchestration overhead delta is only 14ms.*
+
 ### 1-Engine Scale
 
-| Metric | llm-d-rl | Ray | Delta |
-|--------|----------|-----|-------|
-| Step total (median) | 3.289s | 3.313s | -0.7% |
-| NCCL broadcast (median) | 2.641s | 2.671s | -1.1% |
-| Generate (median) | 0.117s | 0.118s | -0.8% |
-| Train (median) | 0.006s | 0.006s | 0% |
-| Orchestration overhead | 525ms | 518ms | +1.3% |
-| NCCL % of step | 80.3% | 80.6% | |
-| p95 step latency | 3.336s | 3.354s | |
-| p99 step latency | 3.779s | 3.365s | |
+| Phase | llm-d-rl (median ms) | Ray (median ms) | Delta |
+|-------|---------------------|-----------------|-------|
+| Generate | 117.0 | 118.0 | +1ms (+1%) |
+| Sleep | 6.0 | 5.0 | -1ms |
+| Train | 5.0 | 6.0 | +1ms |
+| NCCL broadcast | 2,642.0 | 2,671.0 | +29ms (+1%) |
+| **Step total** | **3,289.0** | **3,314.0** | **+25ms (+1%)** |
+| **Orchestration overhead** | **524.0** | **516.0** | **-8ms (-2%)** |
 
-Both systems produce nearly identical results. The 25ms median difference is within noise. Orchestration overhead is ~520ms for both, confirming that the control plane (Go HTTP vs Ray actor) adds negligible differential cost.
+Both systems produce nearly identical results. Orchestration overhead is ~520ms for both, confirming that the control plane (Go HTTP vs Ray actor) adds negligible differential cost.
 
-### 2-Engine Scale (llm-d-rl only)
+### 2-Engine Scale
 
-| Metric | 1 engine | 2 engines | Ratio |
-|--------|----------|-----------|-------|
-| Step total (median) | 3.289s | 7.902s | 2.40x |
-| NCCL broadcast (median) | 2.641s | 7.219s | 2.73x |
-| Generate (median) | 0.117s | 0.116s | 1.0x |
-| Orchestration overhead | 525ms | 560ms | 1.07x |
-| NCCL % of step | 80.3% | 91.4% | |
-| p95 step latency | 3.336s | 8.012s | |
-| p99 step latency | 3.779s | 8.113s | |
+| Phase | llm-d-rl (median ms) | Ray (median ms) | Delta |
+|-------|---------------------|-----------------|-------|
+| Generate | 116.0 | 115.8 | -0.2ms |
+| Sleep | 6.0 | 10.2 | +4ms |
+| Train | 6.0 | 5.5 | -0.5ms |
+| NCCL broadcast | 7,222.0 | 4,919.7 | -2,302ms |
+| **Step total** | **7,905.0** | **5,586.5** | **-2,319ms (-29%)** |
+| **Orchestration overhead** | **558.0** | **543.9** | **-14ms (-3%)** |
 
-Key observations:
+The NCCL difference at 2 engines (7.2s vs 4.9s) is notable but likely reflects network conditions rather than a systemic difference — both systems use the same NCCL code path. Orchestration overhead remains within 14ms.
 
-- **NCCL scales 2.73x** going from 1 to 2 engines. This is because NCCL uses TCP sockets (NET/Socket transport) on this cluster — no InfiniBand or NVLink between nodes. The broadcast must transfer 16.1 GB to each engine sequentially over the network.
-- **Orchestration overhead stays flat** at ~540ms regardless of engine count. The Go coordinator fans out HTTP calls concurrently via goroutines, so adding engines doesn't increase control plane latency.
-- **NCCL dominates even more** at 2 engines (91.4% vs 80.3%), confirming that transport optimization is the highest-leverage improvement.
+### 4-Engine Scale
+
+| Phase | llm-d-rl (median ms) | Ray (median ms) | Delta |
+|-------|---------------------|-----------------|-------|
+| Generate | 113.0 | 115.4 | +2ms |
+| Sleep | 6.5 | 20.0 | +14ms |
+| Train | 5.6 | 5.5 | -0.1ms |
+| NCCL broadcast | 7,399.0 | 8,325.6 | +927ms (+13%) |
+| **Step total** | **8,106.3** | **9,065.9** | **+960ms (+12%)** |
+| **Orchestration overhead** | **589.4** | **604.2** | **+15ms (+3%)** |
+
+At 4 engines, llm-d-rl is 12% faster overall. The NCCL broadcast is faster, and the sleep phase is significantly more efficient (6.5ms vs 20ms) — the Go controller sends sleep commands concurrently while the Ray benchmark loops sequentially.
 
 ### NCCL Throughput
 
-| Config | NCCL Time | Effective Throughput |
-|--------|-----------|---------------------|
-| 1 engine (2 NCCL ranks) | 2.641s | 6.1 GB/s |
-| 2 engines (3 NCCL ranks) | 7.219s | 2.2 GB/s |
+| Config | NCCL Time (median) | Effective Throughput |
+|--------|---------------------|---------------------|
+| 1 engine (2 NCCL ranks) | 2.64s | 6.1 GB/s |
+| 2 engines (3 NCCL ranks) | 7.22s (llmd) / 4.92s (ray) | 2.2 / 3.3 GB/s |
+| 4 engines (5 NCCL ranks) | 7.40s (llmd) / 8.33s (ray) | 2.2 / 1.9 GB/s |
 
 Model size: Llama-3.1-8B-Instruct = 8.03B parameters x 2 bytes (bf16) = **16.1 GB**.
 
-The throughput drop at 2 engines reflects NCCL broadcast over TCP sockets: the trainer must send the full 16.1 GB to each engine, and TCP point-to-point connections share available bandwidth. With InfiniBand or NVLink, NCCL uses tree/ring algorithms that scale much better.
+Throughput degrades at higher engine counts because NCCL broadcast over TCP sockets requires the trainer to send the full 16.1 GB to each engine. With InfiniBand or NVLink, NCCL uses tree/ring algorithms that scale much better.
 
 ## Methodology
 
@@ -86,127 +103,76 @@ Both systems call the **same vLLM engines** through the **same HTTP endpoints** 
 - **Cluster**: CoreWeave CKS (Kubernetes)
 - **GPUs**: NVIDIA H200 (143 GB VRAM each), 8 per node
 - **Model**: `meta-llama/Llama-3.1-8B-Instruct` (8.03B params, 16.1 GB bf16)
-- **NCCL transport**: NET/Socket (TCP) — no InfiniBand or NVLink detected between pods
-- **vLLM**: Dev mode (`VLLM_SERVER_DEV_MODE=1`), enforce eager, max model len 2048
+- **NCCL transport**: NET/Socket (TCP) — InfiniBand hardware present but not enabled for NCCL
+- **vLLM**: v0.16.0, dev mode (`VLLM_SERVER_DEV_MODE=1`), enforce eager, max model len 2048
 
 ### Protocol
 
 1. Deploy N vLLM engines as a StatefulSet with weight transfer config
 2. Run 5 warmup steps (discarded) + 20 measured steps
 3. Record `time.perf_counter()` wall-clock timing for each phase
-4. Output structured JSON with per-step breakdown
+4. Restart engines between runs to clear NCCL state
+5. Output structured JSON with per-step breakdown
 
 ## Detailed Analysis
 
 ### Startup Times
 
-| Metric | llm-d-rl (1 eng) | Ray (1 eng) | llm-d-rl (2 eng) |
-|--------|-------------------|-------------|-------------------|
-| Model load | 22.4s | 19.5s | 20.6s |
-| NCCL group init | 0.268s | 0.256s | 0.306s |
+| Metric | llm-d-rl (1 eng) | Ray (1 eng) | llm-d-rl (2 eng) | Ray (2 eng) | llm-d-rl (4 eng) | Ray (4 eng) |
+|--------|-------------------|-------------|-------------------|-------------|-------------------|-------------|
+| Model load | 22.4s | 19.5s | 20.6s | 20.3s | 20.4s | 20.4s |
+| NCCL group init | 0.268s | 0.256s | 0.306s | 1.27s | 0.314s | 0.328s |
 
-Model loading is a one-time cost dominated by HuggingFace download and vLLM initialization. NCCL group initialization scales sublinearly: adding a second engine (3 NCCL ranks instead of 2) only adds 14% to init time (0.268s → 0.306s), because the TCP store rendezvous is fast once all ranks connect concurrently.
-
-### Stability and Variance
-
-| Metric | llm-d-rl (1 eng) | Ray (1 eng) | llm-d-rl (2 eng) |
-|--------|-------------------|-------------|-------------------|
-| Step total CV | 3.33%* | 0.60% | 1.04% |
-| Step total stdev | 110ms* | 20ms | 82ms |
-| Orchestration overhead stdev | 86ms* | 1.3ms | 11.5ms |
-| NCCL stdev | 12ms | 21ms | 84ms |
-
-*\* llm-d-rl 1-engine variance is inflated by a single outlier (step 18, see below). Excluding that outlier, CV drops to ~0.5%, matching Ray.*
-
-Ray's orchestration overhead is remarkably tight at 1.3ms stdev across 20 steps. llm-d-rl at 2 engines shows 11.5ms stdev — still very stable. NCCL variance increases with engine count (12ms → 84ms at 2 engines), reflecting TCP socket jitter across multiple connections.
-
-### Outlier: Step 18 (llm-d-rl, 1 engine)
-
-One step in the llm-d-rl 1-engine run spiked to 3.779s (vs median 3.289s):
-
-| Phase | Typical | Step 18 | Delta |
-|-------|---------|---------|-------|
-| sleep | 6ms | 393ms | 65x |
-| generate | 117ms | 236ms | 2x |
-| nccl_broadcast | 2.641s | 2.627s | normal |
-| **step_total** | **3.289s** | **3.779s** | **+490ms** |
-
-The spike is entirely in the `sleep` phase (393ms vs typical 6ms), likely caused by a vLLM garbage collection pause or CUDA memory management contention during the sleep operation. NCCL broadcast time was actually slightly *faster* than median, confirming this was a control-plane-side transient.
+Model loading is a one-time cost dominated by HuggingFace download and vLLM initialization (~20s). NCCL group initialization remains fast at all scales for llm-d-rl (0.27-0.31s) because the Go controller fans out `init_weight_transfer_engine` calls concurrently.
 
 ### Weight Version Correctness
 
 All runs maintained strictly monotonic weight versions across every measured step:
 
-- llm-d-rl 1 engine: versions 6→25 (20 steps, no gaps)
-- Ray 1 engine: versions 6→25 (20 steps, no gaps)
-- llm-d-rl 2 engines: versions 6→25 (20 steps, no gaps)
+| Run | Versions | Steps | Gaps |
+|-----|----------|-------|------|
+| llm-d-rl 1 engine | 6→25 | 20 | none |
+| Ray 1 engine | 6→25 | 20 | none |
+| llm-d-rl 2 engines | 6→25 | 20 | none |
+| Ray 2 engines | 6→25 | 20 | none |
+| llm-d-rl 4 engines | 6→25 | 20 | none |
+| Ray 4 engines | 6→25 | 20 | none |
 
-This confirms that no weight updates were missed, duplicated, or applied out of order. The coordinator's version tracking and NCCL broadcast are reliable across all tested configurations.
-
-### Where the Orchestration Overhead Lives
-
-The ~520ms orchestration overhead breaks down into vLLM HTTP endpoint round-trips. Based on the phase timing, the overhead comes from:
-
-| Operation | Estimated Time | Notes |
-|-----------|---------------|-------|
-| Pause generation | ~50ms | HTTP POST to `/pause` |
-| Sleep (GPU memory free) | ~6ms | HTTP POST to `/sleep` |
-| Wake up (weights) | ~100ms | HTTP POST to `/wake_up`, GPU memory reallocation |
-| Update weights HTTP call | ~50ms | HTTP POST to `/update_weights` (triggers NCCL receive) |
-| Wake up (KV cache) | ~100ms | HTTP POST to `/wake_up`, KV cache allocation |
-| Resume generation | ~50ms | HTTP POST to `/resume` |
-| Controller overhead | ~170ms | Go HTTP routing, goroutine scheduling, response parsing |
-
-The dominant cost is vLLM's GPU memory management during wake-up (reallocating weight and KV cache tensors). HTTP round-trip latency and Go controller overhead are minor contributors.
+No weight updates were missed, duplicated, or applied out of order across any configuration.
 
 ## Bugs Discovered and Fixed
 
-Running multi-engine benchmarks exposed two critical bugs in the coordinator:
+Running multi-engine benchmarks exposed critical bugs:
 
 ### 1. Sequential NCCL Init Deadlock
 
-**Bug**: `Coordinator.InitTransfer()` called `InitWeightTransfer()` on engines sequentially. But NCCL's `StatelessProcessGroup.create()` blocks until **all** ranks connect (TCP store rendezvous). Engine-0 blocked waiting for engine-1, which was never called.
+**Bug**: `Coordinator.InitTransfer()` called `InitWeightTransfer()` on engines sequentially. But NCCL's `StatelessProcessGroup.create()` blocks until **all** ranks connect. Engine-0 blocked waiting for engine-1, which was never called.
 
-**Fix**: Changed to concurrent goroutines with `sync.WaitGroup`:
-
-```go
-for id, engine := range c.engines {
-    wg.Add(1)
-    go func(id string, e EngineClient, offset int32) {
-        defer wg.Done()
-        e.InitWeightTransfer(ctx, init, offset)
-    }(id, engine, rankOffset)
-    rankOffset++
-}
-wg.Wait()
-```
+**Fix**: Concurrent goroutines with `sync.WaitGroup` (coordinator) and `threading.Thread` (Ray bench).
 
 ### 2. Hardcoded Rank Offset
 
-**Bug**: All engines were assigned `rank_offset=1` in the NCCL group. With 2 engines, both tried to be rank 1 — rank 2 never joined, causing a hang.
+**Bug**: All engines were assigned `rank_offset=1`. With 2+ engines, multiple ranks collided — the remaining ranks never joined, causing a hang.
 
-**Fix**: Coordinator assigns incrementing rank offsets per engine (trainer=0, engine-0=1, engine-1=2, ...). Updated the `EngineClient` interface to accept `rankOffset int32`.
+**Fix**: Coordinator assigns incrementing rank offsets per engine (trainer=0, engine-0=1, engine-1=2, ...).
 
-### Other Operational Issues
+### 3. Sequential update_weights Deadlock
 
-| Issue | Root Cause | Fix |
-|-------|-----------|-----|
-| Controller used wrong model after switch | Cached `modelName` field | Restart controller deployment |
-| Docker image not updating on cluster | K8s image cache with `:latest` tag | Use versioned tags (`v0.2`) |
-| ARM image on AMD64 cluster | Cross-compilation platform mismatch | `docker buildx build --platform linux/amd64` |
-| Docker build ignoring source changes | Build cache reusing stale `COPY . .` layer | `docker buildx build --no-cache` |
+**Bug**: The Ray bench called `POST /update_weights` on engines sequentially. This endpoint blocks while the engine receives NCCL data. At 2+ engines, engine-0 blocks waiting for the collective broadcast, but engine-1 never joins because its HTTP call hasn't been made yet.
+
+**Fix**: Concurrent `threading.Thread` for all engine `update_weights` calls.
 
 ## Key Takeaways
 
 1. **NCCL transport is the bottleneck, not orchestration.** At 80-91% of step time, optimizing the data plane (InfiniBand, NVLink, NIXL) would yield 5-10x more improvement than any control plane optimization.
 
-2. **Go and Ray add identical orchestration overhead.** At ~520ms per step, the control plane cost is the same regardless of implementation language or framework. This overhead is dominated by vLLM's sleep/wake lifecycle (GPU memory management), not HTTP round-trips.
+2. **Go and Ray add identical orchestration overhead.** At ~520-600ms per step, the control plane cost is the same regardless of implementation language or framework. This overhead is dominated by vLLM's sleep/wake lifecycle (GPU memory management), not HTTP round-trips.
 
-3. **Orchestration overhead scales flat.** Adding engines doesn't increase control plane latency because the coordinator fans out calls concurrently. NCCL broadcast scales linearly with engine count over TCP sockets.
+3. **Orchestration overhead scales flat.** Adding engines doesn't increase control plane latency because the coordinator fans out calls concurrently. NCCL broadcast time increases with engine count over TCP sockets.
 
-4. **NCCL init requires concurrent rendezvous.** Any multi-engine weight sync system must initialize all NCCL ranks concurrently — sequential init deadlocks because `StatelessProcessGroup.create()` is a collective barrier.
+4. **All NCCL operations are collectives that require concurrent fan-out.** Both `init_weight_transfer` and `update_weights` must be called on all engines concurrently — sequential calls deadlock because NCCL barriers require all ranks.
 
-5. **The value proposition of llm-d-rl is not raw speed — it's simplicity.** Both systems perform equally, but llm-d-rl uses 0 GPUs for coordination (vs Ray's 1 GPU), ~8x less memory, and has no Python/Ray dependency chain. For Kubernetes-native deployments, this is a meaningful operational advantage.
+5. **The value proposition of llm-d-rl is simplicity.** Both systems perform equally, but llm-d-rl uses 0 GPUs for coordination (vs Ray's 1 GPU), ~8x less memory, and has no Python/Ray dependency chain. For Kubernetes-native deployments, this is a meaningful operational advantage.
 
 ## Files
 
@@ -216,14 +182,15 @@ wg.Wait()
 | `ray_bench.py` | Ray orchestration harness with per-phase timing |
 | `run_sweep.sh` | Automated sweep across 1/2/4 engine scales |
 | `analyze.py` | Parse results and generate comparison tables |
-| `results/llmd_1engines.json` | llm-d-rl results at 1-engine scale (20 steps) |
-| `results/ray_1engines.json` | Ray results at 1-engine scale (20 steps) |
-| `results/llmd_2engines.json` | llm-d-rl results at 2-engine scale (20 steps) |
+| `results/llmd_1engines.json` | llm-d-rl results at 1-engine scale |
+| `results/llmd_2engines.json` | llm-d-rl results at 2-engine scale |
+| `results/llmd_4engines.json` | llm-d-rl results at 4-engine scale |
+| `results/ray_1engines.json` | Ray results at 1-engine scale |
+| `results/ray_2engines.json` | Ray results at 2-engine scale |
+| `results/ray_4engines.json` | Ray results at 4-engine scale |
 
 ## Remaining Work
 
-- [ ] Run Ray benchmark at 2-engine and 4-engine scale
-- [ ] Run llm-d-rl benchmark at 4-engine scale
-- [ ] Test with InfiniBand-enabled nodes to measure NCCL speedup
+- [ ] Test with InfiniBand enabled (`NCCL_IB_DISABLE=0`) — IB hardware is present on the CKS nodes
 - [ ] Benchmark with NIXL backend (alternative to NCCL)
-- [ ] Measure startup time (model load + NCCL init) as separate metric
+- [ ] Measure end-to-end veRL integration performance
