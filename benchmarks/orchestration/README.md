@@ -19,7 +19,6 @@ We validated the controller at 1, 2, and 4 engine scales on CKS with NVIDIA H200
 | Full weight sync cycle | **0.99s** |
 | NCCL broadcast (16.1 GB) | 0.34s (47.8 GB/s) |
 | Orchestration overhead | 0.53s |
-| GPUs used for coordination | **0** |
 | Weight version correctness | 20/20 steps, no gaps |
 
 **Orchestration overhead** (everything except generate, train, and NCCL broadcast) is ~527ms per step. This is dominated by vLLM's internal GPU memory management during sleep/wake — not HTTP round-trips or controller logic. We confirmed this by running an equivalent Ray-based harness that calls the same vLLM endpoints: orchestration overhead was identical (~520-600ms) at every scale.
