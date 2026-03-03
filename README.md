@@ -8,6 +8,8 @@ llm-d-rl provides the control plane that RL training frameworks need to orchestr
 
 Every RL post-training framework (veRL, OpenRLHF, SkyRL, NeMo-RL, Slime) implements its own inference orchestration layer: weight sync via NCCL, engine health monitoring, request routing, sleep/wake for GPU sharing. These implementations are tightly coupled to specific inference backends and use framework-specific RPCs (usually Ray). llm-d-rl provides these as reusable, backend-agnostic HTTP APIs that any training loop can consume.
 
+The controller is a standalone Go binary with **no Kubernetes dependencies**. It talks HTTP to vLLM engines and runs on any infrastructure — Slurm, bare metal, Docker, or Kubernetes. Integration with llm-d's [inference scheduler (EPP)](https://github.com/llm-d/llm-d-inference-scheduler) for KV-cache-aware routing is planned and will require Kubernetes, but the core controller and weight sync path do not.
+
 ## Architecture
 
 ```
@@ -121,9 +123,38 @@ python3 examples/slime/grpo_training_loop.py --controller-url http://localhost:8
 python3 examples/verl/ppo_training_loop.py --controller-url http://localhost:8090
 ```
 
-### On a GPU cluster (CoreWeave CKS)
+### On Slurm
 
 Full end-to-end with real vLLM, real NCCL weight sync, and real GPU memory management.
+
+```bash
+# Single sbatch that launches 4 engines + controller + trainer
+sbatch deploy/slurm/run.sbatch
+```
+
+Or run each component manually:
+
+```bash
+# Start vLLM engines (one per GPU)
+VLLM_SERVER_DEV_MODE=1 srun --gres=gpu:1 \
+  python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --port 8000 --enforce-eager --max-model-len 2048 \
+    --weight-transfer-config '{"backend":"nccl"}' &
+
+# Start controller (no GPU)
+./rollout-controller \
+  --engines=http://localhost:8000 \
+  --port=8090 &
+
+# Run training
+srun --gres=gpu:1 python examples/verl/ppo_with_llmd.py \
+  --controller-url http://localhost:8090
+```
+
+See `deploy/slurm/` for details and InfiniBand configuration.
+
+### On Kubernetes
 
 ```bash
 # 1. Build and push the controller image
@@ -136,7 +167,7 @@ kubectl create secret generic hf-token \
   --namespace=llm-d-rl \
   --from-literal=token=hf_YOUR_TOKEN
 
-# 3. Deploy vLLM engine (wait ~2-5 min for model load)
+# 3. Deploy vLLM engines (wait ~2-5 min for model load)
 kubectl apply -f deploy/cks/vllm-engine.yaml
 kubectl -n llm-d-rl wait --for=condition=ready pod -l app=vllm-engine --timeout=600s
 
@@ -147,13 +178,9 @@ kubectl -n llm-d-rl wait --for=condition=ready pod -l app=rollout-controller --t
 # 5. Run the NCCL weight trainer
 kubectl apply -f deploy/cks/trainer-job.yaml
 kubectl -n llm-d-rl logs -f job/nccl-trainer
-
-# 6. Verify
-kubectl -n llm-d-rl exec deploy/rollout-controller -- \
-  wget -qO- http://localhost:8090/v1/weights/version
 ```
 
-The trainer loads Llama-3.2-1B, perturbs weights (simulating gradient steps), and broadcasts them to vLLM via NCCL. The controller orchestrates the sleep/wake/sync lifecycle. See `deploy/cks/` for the full manifests.
+See `deploy/cks/` for the full manifests.
 
 ### CLI flags
 
@@ -181,7 +208,8 @@ make docker-build   # build container image
 - [Examples](examples/README.md) — Slime/GRPO and veRL/PPO training loop examples
   - [Slime/GRPO](examples/slime/) — GRPO with group-relative advantages (7 phases)
   - [veRL/PPO](examples/verl/) — PPO with critic network and GAE (11 phases)
-- [CKS deployment](deploy/cks/) — Kubernetes manifests for CoreWeave CKS with real NCCL weight sync
+- [Slurm deployment](deploy/slurm/) — sbatch scripts for Slurm clusters
+- [Kubernetes deployment](deploy/cks/) — manifests for Kubernetes clusters (tested on CoreWeave CKS)
 - [North star design](docs/proposals/rl-rollout-northstar.md) — technical specification and framework analysis
 - [Roadmap](docs/proposals/roadmap.md) — multi-phase implementation plan
 
