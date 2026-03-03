@@ -12,7 +12,7 @@ all: build
 ##@ Build
 
 .PHONY: build
-build: build-rollout-controller build-weight-sync-proxy ## Build all binaries
+build: build-rollout-controller ## Build all binaries
 
 .PHONY: build-rollout-controller
 build-rollout-controller: ## Build the rollout controller
