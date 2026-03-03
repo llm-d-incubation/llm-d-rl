@@ -123,37 +123,6 @@ python3 examples/slime/grpo_training_loop.py --controller-url http://localhost:8
 python3 examples/verl/ppo_training_loop.py --controller-url http://localhost:8090
 ```
 
-### On Slurm
-
-Full end-to-end with real vLLM, real NCCL weight sync, and real GPU memory management.
-
-```bash
-# Single sbatch that launches 4 engines + controller + trainer
-sbatch deploy/slurm/run.sbatch
-```
-
-Or run each component manually:
-
-```bash
-# Start vLLM engines (one per GPU)
-VLLM_SERVER_DEV_MODE=1 srun --gres=gpu:1 \
-  python -m vllm.entrypoints.openai.api_server \
-    --model meta-llama/Llama-3.1-8B-Instruct \
-    --port 8000 --enforce-eager --max-model-len 2048 \
-    --weight-transfer-config '{"backend":"nccl"}' &
-
-# Start controller (no GPU)
-./rollout-controller \
-  --engines=http://localhost:8000 \
-  --port=8090 &
-
-# Run training
-srun --gres=gpu:1 python examples/verl/ppo_with_llmd.py \
-  --controller-url http://localhost:8090
-```
-
-See `deploy/slurm/` for details and InfiniBand configuration.
-
 ### On Kubernetes
 
 ```bash
@@ -181,6 +150,10 @@ kubectl -n llm-d-rl logs -f job/nccl-trainer
 ```
 
 See `deploy/cks/` for the full manifests.
+
+### On Slurm (untested)
+
+The controller has no Kubernetes dependencies — it's a standalone binary that talks HTTP to vLLM engines. See `deploy/slurm/` for example sbatch scripts and manual launch instructions.
 
 ### CLI flags
 
