@@ -2,24 +2,28 @@
 
 ## Phases
 
-### Phase 0: 
+### Phase 0: **COMPLETE**
 
 Establish the project, validate the API surface with one framework, and prove the weight sync path end-to-end.
 
-- [ ] **Rollout Controller skeleton:** HTTP/gRPC server exposing the RolloutControl API surface
-- [ ] **Weight sync coordinator (NCCL path):** Orchestrate pause → init transfer group → broadcast → resume using vLLM's native `WeightTransferEngine` HTTP endpoints
-- [ ] **Engine pool health monitoring:** Periodic health checks against vLLM `/health` endpoint, report pool status
-- [ ] **Integration with inference scheduler:** Route `Generate` requests through the existing EPP for KV-cache-aware dispatch
-- [ ] **End-to-end demo:** Single training script (e.g., simple GRPO loop) using llm-d rollout controller instead of Ray-managed vLLM actors. Target: OpenRLHF or veRL as first consumer.
-- [ ] **llm-d-inference-sim support:** Validate the full lifecycle without GPUs using the existing vLLM simulator
+- [x] **Rollout Controller skeleton:** Go HTTP server exposing the RolloutControl API (`/v1/generate`, `/v1/weights/*`, `/v1/engines/*`, `/v1/pool/status`)
+- [x] **Weight sync coordinator (NCCL path):** Orchestrate pause → init transfer group → broadcast → resume using vLLM's native `WeightTransferEngine` HTTP endpoints. Concurrent fan-out for NCCL collectives.
+- [x] **Engine pool health monitoring:** Periodic health checks against vLLM `/health` endpoint, pool status via `/v1/pool/status`
+- [ ] **Integration with inference scheduler:** Route `Generate` requests through the existing EPP for KV-cache-aware dispatch *(moved to Phase 1)*
+- [x] **End-to-end demo:** `ppo_with_llmd.py` — 10-step PPO training loop using llm-d-rl controller with veRL-style `LlmdCheckpointEngineManager`. Validated on CKS with 4 H200-backed vLLM engines over InfiniBand (0.337s NCCL broadcast, ~1.77s/step).
+- [ ] **llm-d-inference-sim support:** Validate the full lifecycle without GPUs using the existing vLLM simulator *(moved to Phase 1)*
 
-**Exit criteria:** A training script can call llm-d's HTTP API to generate rollouts and push weight updates, with the controller managing vLLM pods on Kubernetes.
+**Exit criteria:** A training script can call llm-d's HTTP API to generate rollouts and push weight updates, with the controller managing vLLM pods on Kubernetes. **Met** — `ppo_with_llmd.py` completes 10 PPO steps with weight versions 1→10, NCCL over IB at 47.8 GB/s, 0 GPUs for coordination.
 
 ---
 
 ### Phase 1: primitives 
 
 Harden the five rollout primitives to production quality.
+
+#### Deferred from Phase 0
+- [ ] **Integration with inference scheduler:** Route `Generate` requests through the existing EPP for KV-cache-aware dispatch
+- [ ] **llm-d-inference-sim support:** Validate the full lifecycle without GPUs using the existing vLLM simulator
 
 #### Weight Synchronization
 - [ ] **NIXL/RDMA backend:** Add NIXL transport for cross-node weight transfer alongside NCCL
