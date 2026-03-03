@@ -378,6 +378,8 @@ spec:
       labels:
         app: verl-llmd-trainer
     spec:
+      nodeSelector:
+        kubernetes.io/hostname: gc3a4f4
       restartPolicy: Never
       containers:
         - name: trainer
@@ -395,8 +397,14 @@ spec:
             - "--max-tokens"
             - "32"
           env:
+            - name: NCCL_IB_DISABLE
+              value: "0"
+            - name: NCCL_NET
+              value: "IB"
             - name: NCCL_DEBUG
               value: "INFO"
+            - name: NCCL_IB_HCA
+              value: "ibp"
             - name: PYTHONPATH
               value: "/scripts"
             - name: HF_TOKEN
@@ -417,8 +425,10 @@ spec:
           resources:
             limits:
               nvidia.com/gpu: "1"
+              rdma/ib: "1"
             requests:
               nvidia.com/gpu: "1"
+              rdma/ib: "1"
               memory: "32Gi"
               cpu: "4"
       volumes:
