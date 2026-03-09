@@ -5,7 +5,7 @@ COPY go.mod ./
 COPY go.sum* ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build \
+RUN CGO_ENABLED=0 GOOS=linux go build -tags k8s \
     -ldflags "-s -w -X main.version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)" \
     -o /rollout-controller ./cmd/rollout-controller
 

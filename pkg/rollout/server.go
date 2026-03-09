@@ -23,16 +23,24 @@ type Server struct {
 	pool        *lifecycle.PoolManager
 	coordinator *weightsync.Coordinator
 
-	mu            sync.RWMutex
-	weightVersion int64
-	modelName     string // cached model name from engine
+	// eppURL is the HTTP base URL of the EPP-fronted gateway (e.g. Envoy Gateway).
+	// When set, inference requests are forwarded here for KV-cache-aware routing.
+	// When empty, requests are dispatched directly to an engine from the pool.
+	eppURL string
+
+	mu               sync.RWMutex
+	weightVersion    int64
+	cachedModelName  string // lazily populated on first /v1/models query
 }
 
 // NewServer creates a new rollout controller server.
-func NewServer(pool *lifecycle.PoolManager, coordinator *weightsync.Coordinator) *Server {
+// eppURL is the HTTP base URL of the EPP/gateway endpoint; pass "" to use
+// direct engine dispatch (fallback for local development).
+func NewServer(pool *lifecycle.PoolManager, coordinator *weightsync.Coordinator, eppURL string) *Server {
 	return &Server{
 		pool:        pool,
 		coordinator: coordinator,
+		eppURL:      eppURL,
 	}
 }
 
@@ -69,40 +77,50 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Pick a ready engine from the pool.
-	// TODO: Replace with EPP routing for KV-cache-aware dispatch.
-	engine, err := s.pool.PickReadyEngine()
-	if err != nil {
-		http.Error(w, fmt.Sprintf("no engines available: %v", err), http.StatusServiceUnavailable)
-		return
-	}
+	var resp *v1alpha1.GenerateResponse
+	var err error
 
-	// Translate to OpenAI completions format and forward.
-	resp, err := s.forwardToEngine(r.Context(), engine, &req)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("generate: %v", err), http.StatusBadGateway)
-		return
+	if s.eppURL != "" {
+		// Route through the EPP-fronted gateway for KV-cache-aware dispatch.
+		resp, err = s.forwardToEPP(r.Context(), &req)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("generate via EPP: %v", err), http.StatusBadGateway)
+			return
+		}
+	} else {
+		// Fallback: direct dispatch to a ready engine from the pool.
+		engine, pickErr := s.pool.PickReadyEngine()
+		if pickErr != nil {
+			http.Error(w, fmt.Sprintf("no engines available: %v", pickErr), http.StatusServiceUnavailable)
+			return
+		}
+		resp, err = s.forwardToEngine(r.Context(), engine, &req)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("generate: %v", err), http.StatusBadGateway)
+			return
+		}
+		resp.EngineID = engine.ID
 	}
 
 	s.mu.RLock()
 	resp.WeightVersion = s.weightVersion
 	s.mu.RUnlock()
-	resp.EngineID = engine.ID
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
 
-// discoverModelName queries the engine's /v1/models endpoint to get the served model name.
-func (s *Server) discoverModelName(ctx context.Context, engine *lifecycle.EngineInfo) string {
+// discoverModelName queries baseURL/v1/models the first time it is called and
+// caches the result. Falls back to "default" if the endpoint is unreachable.
+func (s *Server) discoverModelName(ctx context.Context, baseURL string) string {
 	s.mu.RLock()
-	name := s.modelName
+	name := s.cachedModelName
 	s.mu.RUnlock()
 	if name != "" {
 		return name
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, engine.Address+"/v1/models", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/v1/models", nil)
 	if err != nil {
 		return "default"
 	}
@@ -121,17 +139,15 @@ func (s *Server) discoverModelName(ctx context.Context, engine *lifecycle.Engine
 	}
 
 	s.mu.Lock()
-	s.modelName = models.Data[0].ID
+	s.cachedModelName = models.Data[0].ID
 	s.mu.Unlock()
 	return models.Data[0].ID
 }
 
-// forwardToEngine translates a GenerateRequest to OpenAI /v1/completions
-// format, forwards it to the engine, and translates the response back.
-func (s *Server) forwardToEngine(ctx context.Context, engine *lifecycle.EngineInfo, req *v1alpha1.GenerateRequest) (*v1alpha1.GenerateResponse, error) {
-	// Build OpenAI completions request.
+// buildOAIRequest constructs the OpenAI /v1/completions JSON body.
+func (s *Server) buildOAIRequest(ctx context.Context, baseURL string, req *v1alpha1.GenerateRequest) ([]byte, error) {
 	oaiReq := map[string]interface{}{
-		"model":  s.discoverModelName(ctx, engine),
+		"model":  s.discoverModelName(ctx, baseURL),
 		"prompt": req.PromptTokenIDs,
 	}
 	if req.SamplingParams != nil {
@@ -155,54 +171,27 @@ func (s *Server) forwardToEngine(ctx context.Context, engine *lifecycle.EngineIn
 	if req.ReturnLogprobs {
 		oaiReq["logprobs"] = 1
 	}
+	return json.Marshal(oaiReq)
+}
 
-	body, err := json.Marshal(oaiReq)
-	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		engine.Address+"/v1/completions", bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	httpResp, err := http.DefaultClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("POST /v1/completions: %w", err)
-	}
-	defer httpResp.Body.Close()
-
-	respBody, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	if httpResp.StatusCode >= 400 {
-		return nil, fmt.Errorf("engine returned %d: %s", httpResp.StatusCode, string(respBody))
-	}
-
-	// Parse OpenAI completions response.
+// parseOAIResponse parses an OpenAI /v1/completions response body.
+func parseOAIResponse(respBody []byte) (*v1alpha1.GenerateResponse, error) {
 	var oaiResp struct {
 		Choices []struct {
 			Text         string `json:"text"`
 			FinishReason string `json:"finish_reason"`
 			Logprobs     *struct {
 				TokenLogprobs []float32 `json:"token_logprobs"`
-				Tokens        []string  `json:"tokens"`
 			} `json:"logprobs"`
 		} `json:"choices"`
 	}
 	if err := json.Unmarshal(respBody, &oaiResp); err != nil {
 		return nil, fmt.Errorf("parse response: %w", err)
 	}
-
 	resp := &v1alpha1.GenerateResponse{}
 	if len(oaiResp.Choices) > 0 {
 		choice := oaiResp.Choices[0]
 		resp.FinishReason = choice.FinishReason
-		// Convert output text to token IDs (simple byte-level fallback).
 		for _, c := range choice.Text {
 			resp.OutputTokenIDs = append(resp.OutputTokenIDs, int32(c))
 		}
@@ -210,8 +199,57 @@ func (s *Server) forwardToEngine(ctx context.Context, engine *lifecycle.EngineIn
 			resp.Logprobs = choice.Logprobs.TokenLogprobs
 		}
 	}
-
 	return resp, nil
+}
+
+// postCompletions is the shared implementation for both EPP and direct-engine
+// dispatch. It builds the OAI request body, POSTs to baseURL/v1/completions,
+// applies any caller-supplied extra headers, and parses the response.
+func (s *Server) postCompletions(ctx context.Context, baseURL string, req *v1alpha1.GenerateRequest, extraHeaders map[string]string) (*v1alpha1.GenerateResponse, error) {
+	body, err := s.buildOAIRequest(ctx, baseURL, req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		baseURL+"/v1/completions", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	for k, v := range extraHeaders {
+		httpReq.Header.Set(k, v)
+	}
+
+	httpResp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("POST %s/v1/completions: %w", baseURL, err)
+	}
+	defer httpResp.Body.Close()
+
+	respBody, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	if httpResp.StatusCode >= 400 {
+		return nil, fmt.Errorf("POST %s/v1/completions returned %d: %s", baseURL, httpResp.StatusCode, string(respBody))
+	}
+	return parseOAIResponse(respBody)
+}
+
+// forwardToEPP sends a GenerateRequest to the EPP-fronted gateway.
+// session_id is forwarded as X-Session-ID for KV-cache session affinity.
+func (s *Server) forwardToEPP(ctx context.Context, req *v1alpha1.GenerateRequest) (*v1alpha1.GenerateResponse, error) {
+	headers := map[string]string{}
+	if req.SessionID != "" {
+		headers["X-Session-ID"] = req.SessionID
+	}
+	return s.postCompletions(ctx, s.eppURL, req, headers)
+}
+
+// forwardToEngine sends a GenerateRequest directly to a vLLM engine.
+func (s *Server) forwardToEngine(ctx context.Context, engine *lifecycle.EngineInfo, req *v1alpha1.GenerateRequest) (*v1alpha1.GenerateResponse, error) {
+	return s.postCompletions(ctx, engine.Address, req, nil)
 }
 
 func (s *Server) handleAbortGeneration(w http.ResponseWriter, r *http.Request) {

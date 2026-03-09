@@ -12,15 +12,18 @@ all: build
 ##@ Build
 
 .PHONY: build
-build: build-rollout-controller ## Build all binaries
+build: build-rollout-controller ## Build lightweight binary (no k8s deps)
 
 .PHONY: build-rollout-controller
-build-rollout-controller: ## Build the rollout controller
+build-rollout-controller: ## Build the rollout controller (no k8s discovery)
 	go build -ldflags "$(LDFLAGS)" -o bin/rollout-controller ./cmd/rollout-controller
 
-.PHONY: build-weight-sync-proxy
-build-weight-sync-proxy: ## Build the weight sync proxy
-	go build -ldflags "$(LDFLAGS)" -o bin/weight-sync-proxy ./cmd/weight-sync-proxy
+.PHONY: build-rollout-controller-k8s
+build-rollout-controller-k8s: ## Build the rollout controller with Kubernetes pod discovery
+	go build -tags k8s -ldflags "$(LDFLAGS)" -o bin/rollout-controller-k8s ./cmd/rollout-controller
+
+.PHONY: build-all
+build-all: build-rollout-controller build-rollout-controller-k8s ## Build both variants
 
 ##@ Development
 

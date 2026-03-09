@@ -27,6 +27,7 @@ spec:
     metadata:
       labels:
         app: vllm-engine
+        llm-d-role: rollout-engine
     spec:
       containers:
         - name: vllm
