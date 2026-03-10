@@ -1,0 +1,97 @@
+# Rollout controller for use with the llm-d inference stack (EPP + Gateway).
+#
+# Differences from rollout-controller.yaml:
+#   - --engine-selector uses llm-d.ai/inference-serving=true (matches EPP label)
+#   - --epp-url routes generation requests through the EPP gateway
+#   - namespace: llm-d-rl
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rollout-controller
+  namespace: llm-d-rl
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rollout-controller
+  namespace: llm-d-rl
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rollout-controller
+  namespace: llm-d-rl
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rollout-controller
+subjects:
+  - kind: ServiceAccount
+    name: rollout-controller
+    namespace: llm-d-rl
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rollout-controller
+  namespace: llm-d-rl
+spec:
+  selector:
+    app: rollout-controller
+  ports:
+    - name: http
+      port: 8090
+      targetPort: 8090
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rollout-controller
+  namespace: llm-d-rl
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rollout-controller
+  template:
+    metadata:
+      labels:
+        app: rollout-controller
+    spec:
+      serviceAccountName: rollout-controller
+      containers:
+        - name: controller
+          image: ghcr.io/chcost/llm-d-rl:latest
+          args:
+            - "--port=8090"
+            - "--engine-selector=llm-d.ai/inference-serving=true"
+            - "--engine-port=8000"
+            - "--namespace=llm-d-rl"
+            - "--epp-url=http://llm-d-inference-gateway-istio.llm-d-rl.svc.cluster.local:80"
+            - "--health-check-interval=15s"
+          ports:
+            - containerPort: 8090
+          readinessProbe:
+            httpGet:
+              path: /v1/health
+              port: 8090
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /v1/health
+              port: 8090
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
