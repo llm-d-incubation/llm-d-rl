@@ -417,13 +417,25 @@ spec:
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: hf-token
-                  key: token
+                  name: llm-d-hf-token
+                  key: HF_TOKEN
+                  optional: true
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: llm-d-hf-token
+                  key: HF_TOKEN
                   optional: true
           volumeMounts:
             - name: trainer-script
               mountPath: /scripts
               readOnly: true
+            - name: cache
+              mountPath: /.cache
+            - name: config
+              mountPath: /.config
+            - name: shm
+              mountPath: /dev/shm
           resources:
             limits:
               nvidia.com/gpu: "1"
@@ -435,6 +447,14 @@ spec:
         - name: trainer-script
           configMap:
             name: nccl-trainer-script
+        - name: cache
+          emptyDir: {}
+        - name: config
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 20Gi
       tolerations:
         - key: "nvidia.com/gpu"
           operator: "Exists"
