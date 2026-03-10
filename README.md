@@ -71,6 +71,26 @@ Two implementations of the `EngineClient` interface:
 - `VLLMClient` — real HTTP calls to vLLM dev-mode endpoints (requires `VLLM_SERVER_DEV_MODE=1`)
 - `SimulatedEngineClient` — forwards health checks to a real server, no-ops everything else (for GPU-free testing)
 
+## Inference routing via EPP
+
+The rollout controller supports two inference dispatch modes:
+
+**Direct dispatch (default, local dev)** — the controller picks a ready engine from its pool and forwards `/v1/completions` directly. Simple round-robin; no infrastructure dependencies beyond the engines themselves.
+
+**EPP-routed dispatch (`--epp-url`)** — the controller forwards `/v1/completions` to an [Envoy Gateway](https://gateway.envoyproxy.io/) fronted by the llm-d [Endpoint Picker (EPP)](https://github.com/llm-d/llm-d-inference-scheduler). The EPP selects the optimal vLLM pod using KV-cache hit rate and load metrics, giving significantly better throughput for multi-turn RL rollouts where prompts share a common prefix.
+
+```
+Training loop
+  └─ POST /v1/generate {session_id, prompt_token_ids}
+       └─ Rollout Controller
+            ├─ [--epp-url set]  POST /v1/completions + X-Session-ID ──► Envoy Gateway ──► EPP ──► best vLLM pod
+            └─ [no --epp-url]   POST /v1/completions ──► round-robin vLLM pod (direct)
+```
+
+The `session_id` field in the generate request is forwarded as the `X-Session-ID` header, which the EPP uses for session affinity — steering repeated requests for the same RL episode to the pod that already has the relevant KV cache populated.
+
+Weight sync operations always bypass the EPP and go directly to each engine pod via the pod watcher, since they require per-engine control (pause, update_weights, resume).
+
 ## Quick start
 
 ### Build
@@ -140,7 +160,7 @@ kubectl create secret generic hf-token \
 kubectl apply -f deploy/cks/vllm-engine.yaml
 kubectl -n llm-d-rl wait --for=condition=ready pod -l app=vllm-engine --timeout=600s
 
-# 4. Deploy rollout controller
+# 4. Deploy rollout controller (includes RBAC for pod discovery)
 kubectl apply -f deploy/cks/rollout-controller.yaml
 kubectl -n llm-d-rl wait --for=condition=ready pod -l app=rollout-controller --timeout=120s
 
@@ -159,11 +179,26 @@ The controller has no Kubernetes dependencies — it's a standalone binary that 
 
 ```
 --port                    HTTP server port (default: 8090)
---engines                 Comma-separated engine URLs (e.g., http://localhost:8000,http://localhost:8001)
 --health-check-interval   Interval between engine health checks (default: 30s)
 --simulate-lifecycle      No-op lifecycle operations for GPU-free demos
 --version                 Print version and exit
+
+Engine discovery (Kubernetes):
+--engine-selector         Label selector for vLLM engine pods (e.g., llm-d-role=rollout-engine)
+--engine-port             vLLM HTTP port on engine pods (default: 8000)
+--namespace               Kubernetes namespace to watch (default: NAMESPACE env, then "default")
+--kubeconfig              Path to kubeconfig file (default: in-cluster config)
+
+Engine discovery (static, for local dev):
+--engines                 Comma-separated engine URLs (e.g., http://localhost:8000)
+
+Inference routing:
+--epp-url                 EPP gateway URL for KV-cache-aware routing (e.g., http://envoy-gateway:80)
 ```
+
+When `--engine-selector` is set it takes precedence over `--engines`. Pods matching the selector are automatically registered when they become Ready and removed when deleted or NotReady.
+
+When `--epp-url` is set, `/v1/generate` requests are forwarded to the EPP-fronted gateway (Envoy Gateway) for KV-cache-aware, session-affinity routing. When unset, requests are dispatched directly to an engine from the pool (round-robin fallback for local development).
 
 ## Development
 
