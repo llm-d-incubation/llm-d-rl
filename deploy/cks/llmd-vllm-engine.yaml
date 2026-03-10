@@ -1,10 +1,10 @@
 # vLLM engine for use with the llm-d inference stack (EPP + Gateway).
 #
-# Uses ghcr.io/llm-d/llm-d-cuda (the llm-d vLLM image) and matches the labels
+# Uses vllm/vllm-openai (upstream vLLM image) and matches the labels
 # and probes from the llm-d-modelservice helm chart (inference-scheduling guide).
 #
 # Differences from vllm-engine.yaml:
-#   - Image: ghcr.io/llm-d/llm-d-cuda:v0.5.0 (llm-d vLLM build)
+#   - Image: vllm/vllm-openai:latest (upstream vLLM)
 #   - Labels: llm-d.ai/* labels matching the llm-d conventions
 #   - Command: vllm serve (llm-d convention)
 #   - Probes: /v1/models for startup/readiness (matches llm-d-modelservice)
@@ -51,20 +51,20 @@ spec:
       terminationGracePeriodSeconds: 130
       containers:
         - name: vllm
-          image: ghcr.io/llm-d/llm-d-cuda:v0.5.0
+          image: vllm/vllm-openai:latest
           imagePullPolicy: IfNotPresent
           command:
             - /bin/bash
             - -c
           args:
-            - >-
-              exec vllm serve meta-llama/Llama-3.2-1B
-              --port 8000
-              --enforce-eager
-              --max-model-len 2048
-              --gpu-memory-utilization 0.85
-              --disable-uvicorn-access-log
-              --weight-transfer-config '{"backend":"nccl"}'
+            - |
+              exec vllm serve meta-llama/Llama-3.2-1B \
+                --port 8000 \
+                --enforce-eager \
+                --max-model-len 2048 \
+                --gpu-memory-utilization 0.85 \
+                --disable-uvicorn-access-log \
+                --weight-transfer-config '{"backend":"nccl"}'
           env:
             - name: VLLM_SERVER_DEV_MODE
               value: "1"
