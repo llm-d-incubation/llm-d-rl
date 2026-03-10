@@ -455,6 +455,16 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 20Gi
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                - worker-145
+                - worker-146
       tolerations:
         - key: "nvidia.com/gpu"
           operator: "Exists"
