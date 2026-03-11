@@ -1,12 +1,11 @@
-# llm-d Inference Stack: EPP + InferencePool + Gateway + HTTPRoute
+# llm-d EPP (Endpoint Picker Plugin) — KV-cache-aware, load-aware routing.
 #
-# Deploys the llm-d inference scheduling infrastructure into the llm-d-rl namespace.
-# The EPP discovers vLLM pods via the InferencePool label selector and provides
-# KV-cache-aware, load-aware routing for inference requests.
+# Deploys the EPP into the llm-d-rl namespace. The EPP discovers vLLM pods
+# via the InferencePool label selector and picks the optimal pod for each request.
 #
 # Prerequisites:
-#   - Gateway API CRDs and Inference Extension CRDs installed (see 00-prereqs.sh)
-#   - Istio or other compatible gateway controller running
+#   - Inference Extension CRDs installed (see deploy/llm-d/prereqs.sh)
+#   - InferencePool + Gateway deployed (see gateway.yaml)
 #   - vLLM pods with label llm-d.ai/inference-serving=true in this namespace
 #
 # Derived from:
@@ -19,11 +18,10 @@ metadata:
   name: llm-d-epp
   namespace: llm-d-rl
 ---
-kind: Role
+kind: ClusterRole
 apiVersion: rbac.authorization.k8s.io/v1
 metadata:
   name: llm-d-epp
-  namespace: llm-d-rl
 rules:
 - apiGroups: ["inference.networking.x-k8s.io"]
   resources: ["inferencepools", "inferenceobjectives", "inferencemodelrewrites"]
@@ -42,16 +40,16 @@ rules:
   verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+kind: ClusterRoleBinding
 metadata:
   name: llm-d-epp-binding
-  namespace: llm-d-rl
 subjects:
 - kind: ServiceAccount
   name: llm-d-epp
+  namespace: llm-d-rl
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: Role
+  kind: ClusterRole
   name: llm-d-epp
 ---
 # EPP plugin configuration — load-aware + prefix-cache-aware scheduling.
@@ -93,9 +91,21 @@ spec:
     metadata:
       labels:
         app: llm-d-epp
+      annotations:
+        sidecar.istio.io/inject: "false"
     spec:
       serviceAccountName: llm-d-epp
       terminationGracePeriodSeconds: 130
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                - worker-145
+                - worker-146
       containers:
       - name: epp
         image: ghcr.io/llm-d/llm-d-inference-scheduler:v0.5.0
@@ -103,6 +113,8 @@ spec:
         args:
         - --pool-name
         - llm-d-pool
+        - --pool-namespace
+        - llm-d-rl
         - --grpc-port
         - "9002"
         - --grpc-health-port
@@ -113,6 +125,7 @@ spec:
         - "vllm:kv_cache_usage_perc"
         - --v
         - "3"
+        - --secure-serving=false
         - --zap-encoder
         - "json"
         env:
@@ -166,58 +179,3 @@ spec:
     port: 9090
     targetPort: 9090
   type: ClusterIP
----
-# InferencePool — the EPP watches pods matching these labels.
-# vLLM pods must carry llm-d.ai/inference-serving=true to be included.
-apiVersion: inference.networking.k8s.io/v1
-kind: InferencePool
-metadata:
-  name: llm-d-pool
-  namespace: llm-d-rl
-spec:
-  selector:
-    matchLabels:
-      llm-d.ai/inference-serving: "true"
-  endpointPickerRef:
-    name: llm-d-epp
-    kind: Service
-    port:
-      number: 9002
-  targetPorts:
-  - number: 8000
----
-# Gateway — Istio creates an Envoy proxy with a Service named
-# llm-d-inference-gateway-istio in this namespace.
-apiVersion: gateway.networking.k8s.io/v1
-kind: Gateway
-metadata:
-  name: llm-d-inference-gateway
-  namespace: llm-d-rl
-spec:
-  gatewayClassName: istio
-  listeners:
-  - name: default
-    port: 80
-    protocol: HTTP
----
-# HTTPRoute — routes all traffic through the InferencePool (EPP).
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-metadata:
-  name: llm-d-pool-route
-  namespace: llm-d-rl
-spec:
-  parentRefs:
-  - name: llm-d-inference-gateway
-  rules:
-  - matches:
-    - path:
-        type: PathPrefix
-        value: /
-    backendRefs:
-    - group: inference.networking.k8s.io
-      kind: InferencePool
-      name: llm-d-pool
-      port: 8000
-    timeouts:
-      request: 120s

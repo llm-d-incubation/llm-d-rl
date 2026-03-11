@@ -47,19 +47,28 @@ kubectl -n llm-d-rl create secret generic llm-d-hf-token \
   --from-literal=HF_TOKEN=hf_YOUR_TOKEN
 ```
 
-### 2. Deploy EPP + Gateway + InferencePool
+### 2. Deploy EPP
 
 ```bash
-kubectl apply -f deploy/cks/epp-gateway.yaml
+kubectl apply -f deploy/cks/epp.yaml
+kubectl -n llm-d-rl wait --for=condition=ready pod \
+  -l app=llm-d-epp --timeout=300s
+```
+
+This creates the EPP Deployment + Service (KV-cache-aware routing on port 9002). The first deploy may take a while as the image is pulled.
+
+### 3. Deploy Gateway + InferencePool
+
+```bash
+kubectl apply -f deploy/cks/gateway.yaml
 ```
 
 This creates:
-- EPP Deployment + Service (KV-cache-aware routing on port 9002)
 - InferencePool CR (watches pods with `llm-d.ai/inference-serving=true`)
 - Gateway (Istio Envoy proxy on port 80)
 - HTTPRoute (routes traffic through the InferencePool)
 
-### 3. Deploy vLLM engines
+### 4. Deploy vLLM engines
 
 ```bash
 kubectl apply -f deploy/cks/llmd-vllm-engine.yaml
@@ -71,7 +80,7 @@ kubectl -n llm-d-rl wait --for=condition=ready pod \
   -l llm-d.ai/inference-serving=true --timeout=600s
 ```
 
-### 4. Deploy rollout controller
+### 5. Deploy rollout controller
 
 ```bash
 kubectl apply -f deploy/cks/llmd-rollout-controller.yaml
@@ -79,7 +88,7 @@ kubectl -n llm-d-rl wait --for=condition=ready pod \
   -l app=rollout-controller --timeout=120s
 ```
 
-### 5. Run a trainer job
+### 6. Run a trainer job
 
 ```bash
 kubectl apply -f deploy/cks/trainer-job.yaml
@@ -122,7 +131,7 @@ kubectl -n llm-d-rl scale statefulset/vllm-engine --replicas=4
 
 ### Use a different gateway controller
 
-Edit `deploy/cks/epp-gateway.yaml`, change the Gateway's `gatewayClassName`:
+Edit `deploy/cks/gateway.yaml`, change the Gateway's `gatewayClassName`:
 - `istio` (default)
 - `kgateway`
 - `gke-l7-regional-external-managed` (GKE)
@@ -145,7 +154,8 @@ These use `--engine-selector=llm-d-role=rollout-engine` and no `--epp-url` (roun
 |---|---|
 | `deploy/llm-d/prereqs.sh` | CRDs + Istio (cluster-level) |
 | `deploy/cks/namespace.yaml` | Namespace |
-| `deploy/cks/epp-gateway.yaml` | EPP + InferencePool + Gateway + HTTPRoute |
+| `deploy/cks/epp.yaml` | EPP Deployment + Service |
+| `deploy/cks/gateway.yaml` | InferencePool + Gateway + HTTPRoute |
 | `deploy/cks/llmd-vllm-engine.yaml` | vLLM with llm-d.ai labels + dev mode |
 | `deploy/cks/llmd-rollout-controller.yaml` | Rollout controller with EPP routing |
 | `deploy/cks/trainer-job.yaml` | Example NCCL weight trainer |

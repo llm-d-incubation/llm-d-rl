@@ -145,10 +145,36 @@ func (s *Server) discoverModelName(ctx context.Context, baseURL string) string {
 }
 
 // buildOAIRequest constructs the OpenAI /v1/completions JSON body.
-func (s *Server) buildOAIRequest(ctx context.Context, baseURL string, req *v1alpha1.GenerateRequest) ([]byte, error) {
+//
+// When eppMode is true, token IDs are sent via the separate "prompt_token_ids"
+// field instead of as the "prompt" value. This is required because the llm-d
+// EPP (Endpoint Picker Plugin) inspects the request body to extract routing
+// metadata (model name, session ID). The EPP's body parser (as of v0.5.0)
+// cannot handle "prompt" when it is a JSON array of integers — it
+// misclassifies the request as chat-completions format and rejects it with:
+//
+//	"invalid chat-completions request: chat-completions request must have
+//	 at least one message"
+//
+// The workaround sends a dummy string in "prompt" (which the EPP can parse)
+// alongside "prompt_token_ids" (which vLLM uses for the actual generation,
+// ignoring the string "prompt" when "prompt_token_ids" is present).
+//
+// When eppMode is false (direct-to-engine), we pass token IDs directly in
+// "prompt" as an int array, which vLLM's /v1/completions endpoint accepts
+// natively without any intermediary body parsing.
+func (s *Server) buildOAIRequest(ctx context.Context, baseURL string, req *v1alpha1.GenerateRequest, eppMode bool) ([]byte, error) {
 	oaiReq := map[string]interface{}{
-		"model":  s.discoverModelName(ctx, baseURL),
-		"prompt": req.PromptTokenIDs,
+		"model": s.discoverModelName(ctx, baseURL),
+	}
+	if eppMode {
+		// Dummy string prompt for the EPP body parser; vLLM ignores it
+		// when prompt_token_ids is present.
+		oaiReq["prompt"] = "tokens"
+		oaiReq["prompt_token_ids"] = req.PromptTokenIDs
+	} else {
+		// Direct-to-engine: vLLM accepts prompt as an int array natively.
+		oaiReq["prompt"] = req.PromptTokenIDs
 	}
 	if req.SamplingParams != nil {
 		sp := req.SamplingParams
@@ -205,8 +231,8 @@ func parseOAIResponse(respBody []byte) (*v1alpha1.GenerateResponse, error) {
 // postCompletions is the shared implementation for both EPP and direct-engine
 // dispatch. It builds the OAI request body, POSTs to baseURL/v1/completions,
 // applies any caller-supplied extra headers, and parses the response.
-func (s *Server) postCompletions(ctx context.Context, baseURL string, req *v1alpha1.GenerateRequest, extraHeaders map[string]string) (*v1alpha1.GenerateResponse, error) {
-	body, err := s.buildOAIRequest(ctx, baseURL, req)
+func (s *Server) postCompletions(ctx context.Context, baseURL string, req *v1alpha1.GenerateRequest, extraHeaders map[string]string, eppMode bool) (*v1alpha1.GenerateResponse, error) {
+	body, err := s.buildOAIRequest(ctx, baseURL, req, eppMode)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
@@ -239,17 +265,21 @@ func (s *Server) postCompletions(ctx context.Context, baseURL string, req *v1alp
 
 // forwardToEPP sends a GenerateRequest to the EPP-fronted gateway.
 // session_id is forwarded as X-Session-ID for KV-cache session affinity.
+// Uses eppMode=true so the request body uses a string "prompt" + separate
+// "prompt_token_ids", which the EPP body parser can handle (see buildOAIRequest).
 func (s *Server) forwardToEPP(ctx context.Context, req *v1alpha1.GenerateRequest) (*v1alpha1.GenerateResponse, error) {
 	headers := map[string]string{}
 	if req.SessionID != "" {
 		headers["X-Session-ID"] = req.SessionID
 	}
-	return s.postCompletions(ctx, s.eppURL, req, headers)
+	return s.postCompletions(ctx, s.eppURL, req, headers, true)
 }
 
 // forwardToEngine sends a GenerateRequest directly to a vLLM engine.
+// Uses eppMode=false so token IDs are passed directly in "prompt" (no EPP
+// body parser in the path).
 func (s *Server) forwardToEngine(ctx context.Context, engine *lifecycle.EngineInfo, req *v1alpha1.GenerateRequest) (*v1alpha1.GenerateResponse, error) {
-	return s.postCompletions(ctx, engine.Address, req, nil)
+	return s.postCompletions(ctx, engine.Address, req, nil, false)
 }
 
 func (s *Server) handleAbortGeneration(w http.ResponseWriter, r *http.Request) {
