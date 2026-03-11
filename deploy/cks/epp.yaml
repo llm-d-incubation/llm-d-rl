@@ -96,16 +96,6 @@ spec:
     spec:
       serviceAccountName: llm-d-epp
       terminationGracePeriodSeconds: 130
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-            - matchExpressions:
-              - key: kubernetes.io/hostname
-                operator: In
-                values:
-                - worker-145
-                - worker-146
       containers:
       - name: epp
         image: ghcr.io/llm-d/llm-d-inference-scheduler:v0.5.0

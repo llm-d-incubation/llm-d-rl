@@ -68,6 +68,8 @@ spec:
           env:
             - name: VLLM_SERVER_DEV_MODE
               value: "1"
+            - name: TRITON_CACHE_DIR
+              value: /tmp/triton
             - name: HUGGING_FACE_HUB_TOKEN
               valueFrom:
                 secretKeyRef:
