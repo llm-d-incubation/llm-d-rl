@@ -66,7 +66,7 @@ spec:
       serviceAccountName: rollout-controller
       containers:
         - name: controller
-          image: quay.io/ezrasilvera/llm-d-rl:v0.1.0
+          image: quay.io/ezrasilvera/llm-d-rl:latest
           args:
             - "--port=8090"
             - "--engine-selector=llm-d.ai/inference-serving=true"

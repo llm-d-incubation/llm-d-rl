@@ -148,6 +148,121 @@ kubectl apply -f deploy/cks/rollout-controller.yaml
 
 These use `--engine-selector=llm-d-role=rollout-engine` and no `--epp-url` (round-robin direct dispatch).
 
+## Architecture Overview
+
+### Request Flow
+
+Inference requests flow through three layers:
+
+1. **Trainer Job** sends generation requests to the **Rollout Controller**
+2. The Rollout Controller forwards them to the **Gateway** (Istio Envoy proxy)
+3. The Gateway calls the **EPP** via gRPC to pick the best vLLM pod, then routes the request there
+
+Weight sync operations (pause/update_weights/resume) bypass the Gateway entirely — the Rollout Controller talks directly to each vLLM pod by IP.
+
+### vLLM Discovery (EPP)
+
+The EPP discovers vLLM pods dynamically through the Kubernetes **InferencePool** CRD:
+
+1. An `InferencePool` resource is created with a label selector (`llm-d.ai/inference-serving=true`)
+2. The EPP is pointed at this pool via `--pool-name` and `--pool-namespace`
+3. The EPP watches the Kubernetes API for pods matching the selector in that namespace
+4. As pods become Ready or are removed, the EPP's internal endpoint list updates automatically
+
+This means scaling vLLM (e.g., `kubectl scale statefulset/vllm-engine --replicas=4`) is picked up immediately — the EPP sees the new pods via its watch and starts routing to them with no restart or config change needed.
+
+### vLLM Discovery (Rollout Controller)
+
+The Rollout Controller has its own independent discovery mechanism for weight sync operations:
+
+1. A **PodWatcher** (`pkg/discovery`) uses a Kubernetes informer with a label selector (e.g., `llm-d.ai/inference-serving=true`)
+2. On Add/Update events, it checks if the pod is Ready and has an IP — if so, it fires an `OnReady` callback with the pod's `http://{podIP}:8000` address
+3. On Delete or NotReady transitions, it fires `OnGone` to deregister the engine
+4. The **PoolManager** (`pkg/lifecycle`) receives these callbacks and maintains the live engine pool, running periodic health checks (every 30s) against each engine
+
+This dual-discovery design means the EPP handles inference routing (KV-cache-aware, load-aware) while the Rollout Controller independently tracks pods for direct weight sync operations.
+
+### Scheduling Plugins
+
+The EPP uses a plugin chain to pick the optimal pod for each request:
+
+- **prefix-cache-scorer** — scores pods by KV-cache prefix hit rate (weighted 2x)
+- **decode-filter** — filters out pods with high decode load
+- **max-score-picker** — picks the highest-scoring pod
+
+This is configured in the `epp-config` ConfigMap (`deploy/cks/epp.yaml`).
+
+## Development
+
+### Prerequisites
+
+- Go 1.24+
+- Docker (for container builds)
+- Access to a Kubernetes cluster with GPU nodes (for end-to-end testing)
+
+### Building
+
+The rollout controller has two build variants:
+
+```bash
+# Lightweight build (no Kubernetes dependencies — uses static engine list via --engines flag)
+make build
+
+# Kubernetes-enabled build (includes pod discovery via --engine-selector)
+make build-k8s
+```
+
+The `k8s` variant uses a Go build tag to include the `pkg/discovery` package, which pulls in the `k8s.io/client-go` dependency.
+
+### Building the Container Image
+
+The Dockerfile always builds the `k8s` variant (with discovery support):
+
+```bash
+# Build with auto-detected version tag
+make docker-build
+
+# Push to registry
+make docker-push
+
+# Override registry or version
+REGISTRY=my-registry.io/my-org VERSION=v1.0.0 make docker-build docker-push
+```
+
+The image is built as a two-stage build: Go compilation on `golang:1.24-alpine`, final image on `distroless/static-debian12:nonroot` (minimal attack surface, ~5MB base).
+
+### Running Locally (without Kubernetes)
+
+For development without a cluster, use the static engine list:
+
+```bash
+make build
+./bin/rollout-controller \
+  --engines=http://localhost:8000 \
+  --port=8090
+```
+
+### Running Locally (with Kubernetes)
+
+Point at your cluster's vLLM pods using a label selector:
+
+```bash
+make build-k8s
+./bin/rollout-controller-k8s \
+  --engine-selector="llm-d.ai/inference-serving=true" \
+  --namespace=llm-d-rl \
+  --kubeconfig=$HOME/.kube/config \
+  --port=8090
+```
+
+### Running Tests
+
+```bash
+make test    # unit tests with race detector
+make lint    # golangci-lint
+make fmt     # gofmt
+```
+
 ## File Reference
 
 | File | Purpose |
