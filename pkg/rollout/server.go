@@ -23,10 +23,11 @@ type Server struct {
 	pool        *lifecycle.PoolManager
 	coordinator *weightsync.Coordinator
 
-	// eppURL is the HTTP base URL of the EPP-fronted gateway (e.g. Envoy Gateway).
-	// When set, inference requests are forwarded here for KV-cache-aware routing.
+	// routerURL is the HTTP base URL of the inference router gateway (e.g.
+	// llm-d inference scheduler behind Envoy/Istio). When set, inference
+	// requests are forwarded here for prefix-cache-aware routing.
 	// When empty, requests are dispatched directly to an engine from the pool.
-	eppURL string
+	routerURL string
 
 	mu               sync.RWMutex
 	weightVersion    int64
@@ -34,13 +35,13 @@ type Server struct {
 }
 
 // NewServer creates a new rollout controller server.
-// eppURL is the HTTP base URL of the EPP/gateway endpoint; pass "" to use
-// direct engine dispatch (fallback for local development).
-func NewServer(pool *lifecycle.PoolManager, coordinator *weightsync.Coordinator, eppURL string) *Server {
+// routerURL is the HTTP base URL of the inference router/gateway endpoint;
+// pass "" to use direct engine dispatch (fallback for local development).
+func NewServer(pool *lifecycle.PoolManager, coordinator *weightsync.Coordinator, routerURL string) *Server {
 	return &Server{
 		pool:        pool,
 		coordinator: coordinator,
-		eppURL:      eppURL,
+		routerURL:   routerURL,
 	}
 }
 
@@ -80,11 +81,11 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	var resp *v1alpha1.GenerateResponse
 	var err error
 
-	if s.eppURL != "" {
-		// Route through the EPP-fronted gateway for KV-cache-aware dispatch.
-		resp, err = s.forwardToEPP(r.Context(), &req)
+	if s.routerURL != "" {
+		// Route through the inference router gateway for prefix-cache-aware dispatch.
+		resp, err = s.forwardToRouter(r.Context(), &req)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("generate via EPP: %v", err), http.StatusBadGateway)
+			http.Error(w, fmt.Sprintf("generate via router: %v", err), http.StatusBadGateway)
 			return
 		}
 	} else {
@@ -146,32 +147,23 @@ func (s *Server) discoverModelName(ctx context.Context, baseURL string) string {
 
 // buildOAIRequest constructs the OpenAI /v1/completions JSON body.
 //
-// When eppMode is true, token IDs are sent via the separate "prompt_token_ids"
-// field instead of as the "prompt" value. This is required because the llm-d
-// EPP (Endpoint Picker Plugin) inspects the request body to extract routing
-// metadata (model name, session ID). The EPP's body parser (as of v0.5.0)
-// cannot handle "prompt" when it is a JSON array of integers — it
-// misclassifies the request as chat-completions format and rejects it with:
+// The prompt format depends on which field is set in the GenerateRequest:
 //
-//	"invalid chat-completions request: chat-completions request must have
-//	 at least one message"
+//   - req.Prompt (text string): sent as "prompt" for the inference router
+//     path. The llm-d inference scheduler tokenizes this text for
+//     prefix-cache-aware routing, then forwards to the engine.
 //
-// The workaround sends a dummy string in "prompt" (which the EPP can parse)
-// alongside "prompt_token_ids" (which vLLM uses for the actual generation,
-// ignoring the string "prompt" when "prompt_token_ids" is present).
-//
-// When eppMode is false (direct-to-engine), we pass token IDs directly in
-// "prompt" as an int array, which vLLM's /v1/completions endpoint accepts
-// natively without any intermediary body parsing.
-func (s *Server) buildOAIRequest(ctx context.Context, baseURL string, req *v1alpha1.GenerateRequest, eppMode bool) ([]byte, error) {
+//   - req.PromptTokenIDs (int array): sent as "prompt" for the direct
+//     engine path. vLLM's /v1/completions endpoint accepts token ID
+//     arrays natively.
+func (s *Server) buildOAIRequest(ctx context.Context, baseURL string, req *v1alpha1.GenerateRequest) ([]byte, error) {
 	oaiReq := map[string]interface{}{
 		"model": s.discoverModelName(ctx, baseURL),
 	}
-	if eppMode {
-		// Dummy string prompt for the EPP body parser; vLLM ignores it
-		// when prompt_token_ids is present.
-		oaiReq["prompt"] = "tokens"
-		oaiReq["prompt_token_ids"] = req.PromptTokenIDs
+	if req.Prompt != "" {
+		// Router path: send the actual text prompt so the inference
+		// scheduler can tokenize it for prefix-cache routing.
+		oaiReq["prompt"] = req.Prompt
 	} else {
 		// Direct-to-engine: vLLM accepts prompt as an int array natively.
 		oaiReq["prompt"] = req.PromptTokenIDs
@@ -228,11 +220,11 @@ func parseOAIResponse(respBody []byte) (*v1alpha1.GenerateResponse, error) {
 	return resp, nil
 }
 
-// postCompletions is the shared implementation for both EPP and direct-engine
+// postCompletions is the shared implementation for both router and direct-engine
 // dispatch. It builds the OAI request body, POSTs to baseURL/v1/completions,
 // applies any caller-supplied extra headers, and parses the response.
-func (s *Server) postCompletions(ctx context.Context, baseURL string, req *v1alpha1.GenerateRequest, extraHeaders map[string]string, eppMode bool) (*v1alpha1.GenerateResponse, error) {
-	body, err := s.buildOAIRequest(ctx, baseURL, req, eppMode)
+func (s *Server) postCompletions(ctx context.Context, baseURL string, req *v1alpha1.GenerateRequest, extraHeaders map[string]string) (*v1alpha1.GenerateResponse, error) {
+	body, err := s.buildOAIRequest(ctx, baseURL, req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
@@ -263,23 +255,23 @@ func (s *Server) postCompletions(ctx context.Context, baseURL string, req *v1alp
 	return parseOAIResponse(respBody)
 }
 
-// forwardToEPP sends a GenerateRequest to the EPP-fronted gateway.
+// forwardToRouter sends a GenerateRequest to the inference router gateway.
 // session_id is forwarded as X-Session-ID for KV-cache session affinity.
-// Uses eppMode=true so the request body uses a string "prompt" + separate
-// "prompt_token_ids", which the EPP body parser can handle (see buildOAIRequest).
-func (s *Server) forwardToEPP(ctx context.Context, req *v1alpha1.GenerateRequest) (*v1alpha1.GenerateResponse, error) {
+// The request's Prompt field (text string) is used as the "prompt" value
+// so the inference scheduler can tokenize it for prefix-cache routing.
+func (s *Server) forwardToRouter(ctx context.Context, req *v1alpha1.GenerateRequest) (*v1alpha1.GenerateResponse, error) {
 	headers := map[string]string{}
 	if req.SessionID != "" {
 		headers["X-Session-ID"] = req.SessionID
 	}
-	return s.postCompletions(ctx, s.eppURL, req, headers, true)
+	return s.postCompletions(ctx, s.routerURL, req, headers)
 }
 
 // forwardToEngine sends a GenerateRequest directly to a vLLM engine.
-// Uses eppMode=false so token IDs are passed directly in "prompt" (no EPP
-// body parser in the path).
+// The request's PromptTokenIDs are passed directly in "prompt" as an int
+// array, which vLLM accepts natively.
 func (s *Server) forwardToEngine(ctx context.Context, engine *lifecycle.EngineInfo, req *v1alpha1.GenerateRequest) (*v1alpha1.GenerateResponse, error) {
-	return s.postCompletions(ctx, engine.Address, req, nil, false)
+	return s.postCompletions(ctx, engine.Address, req, nil)
 }
 
 func (s *Server) handleAbortGeneration(w http.ResponseWriter, r *http.Request) {

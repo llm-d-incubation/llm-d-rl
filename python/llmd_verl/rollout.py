@@ -89,14 +89,17 @@ class LlmdServerAdapter:
             pass
         logger.debug("update_weights: generator consumed (weights sent via NCCL)")
 
-    def generate(self, prompt_token_ids: list[int], max_tokens: int = 32,
+    def generate(self, prompt: str | None = None,
+                 prompt_token_ids: list[int] | None = None,
+                 max_tokens: int = 32,
                  temperature: float = 0.7, **kwargs) -> dict:
         """Generate a rollout via the controller.
 
         Maps to: POST /v1/generate
 
         Args:
-            prompt_token_ids: Tokenized prompt.
+            prompt: Text prompt (for inference router / llm-d path).
+            prompt_token_ids: Tokenized prompt (for direct engine path).
             max_tokens: Maximum tokens to generate.
             temperature: Sampling temperature.
 
@@ -104,6 +107,6 @@ class LlmdServerAdapter:
             Generation response dict with output_token_ids, logprobs, etc.
         """
         return self.client.generate(
-            prompt_token_ids, max_tokens=max_tokens,
-            temperature=temperature, **kwargs,
+            prompt=prompt, prompt_token_ids=prompt_token_ids,
+            max_tokens=max_tokens, temperature=temperature, **kwargs,
         )

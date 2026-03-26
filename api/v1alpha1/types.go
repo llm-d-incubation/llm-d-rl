@@ -68,9 +68,23 @@ const (
 // --- Request/Response Types ---
 
 // GenerateRequest is a request to generate token sequences from prompts.
+//
+// Callers set either Prompt (text string) or PromptTokenIDs (pre-tokenized),
+// depending on the inference target:
+//   - Inference router (llm-d): set Prompt — the router tokenizes the text
+//     for prefix-cache routing and forwards to the engine.
+//   - Direct engine: set PromptTokenIDs — token IDs are passed directly
+//     to the engine's /v1/completions endpoint.
 type GenerateRequest struct {
-	// PromptTokenIDs is the tokenized input prompt.
-	PromptTokenIDs []int32 `json:"prompt_token_ids"`
+	// Prompt is the raw text prompt. When set, it is sent as the "prompt"
+	// string in the OpenAI completions request. Used when routing through
+	// the llm-d inference scheduler, which tokenizes the text for
+	// prefix-cache-aware routing.
+	Prompt string `json:"prompt,omitempty"`
+
+	// PromptTokenIDs is the tokenized input prompt. Used for direct
+	// engine dispatch where the engine accepts token IDs natively.
+	PromptTokenIDs []int32 `json:"prompt_token_ids,omitempty"`
 
 	// SamplingParams controls generation behavior (temperature, top_p, max_tokens, etc.).
 	SamplingParams *SamplingParams `json:"sampling_params,omitempty"`

@@ -15,7 +15,7 @@
 //	rollout-controller \
 //	  --engine-selector llm-d-role=rollout-engine \
 //	  --engine-port 8000 \
-//	  --epp-url http://envoy-gateway.llm-d.svc.cluster.local:80
+//	  --router-url http://envoy-gateway.llm-d.svc.cluster.local:80
 //
 // Usage (local/GPU-free demo):
 //
@@ -53,8 +53,8 @@ func main() {
 		// Static engine list (local development / GPU-free demos).
 		engines = flag.String("engines", "", "Comma-separated engine URLs (e.g., http://localhost:8000). Used when --engine-selector is not set.")
 
-		// Inference routing via EPP (optional).
-		eppURL = flag.String("epp-url", "", "HTTP URL of the EPP-fronted gateway for KV-cache-aware inference routing (e.g., http://envoy-gateway:80). If unset, requests are dispatched directly to engines.")
+		// Inference routing via router/gateway (optional).
+		routerURL = flag.String("router-url", "", "HTTP URL of the inference router gateway for prefix-cache-aware routing (e.g., http://llm-d-inference-gateway:80). If unset, requests are dispatched directly to engines.")
 	)
 
 	// Kubernetes discovery flags are registered only when built with -tags k8s.
@@ -127,13 +127,13 @@ func main() {
 		log.Printf("WARNING: no engine source configured — set --engine-selector or --engines")
 	}
 
-	if *eppURL != "" {
-		log.Printf("inference routing: via EPP gateway at %s", *eppURL)
+	if *routerURL != "" {
+		log.Printf("inference routing: via router gateway at %s", *routerURL)
 	} else {
-		log.Printf("inference routing: direct engine dispatch (no EPP)")
+		log.Printf("inference routing: direct engine dispatch (no router)")
 	}
 
-	server := rollout.NewServer(poolManager, coordinator, *eppURL)
+	server := rollout.NewServer(poolManager, coordinator, *routerURL)
 
 	go poolManager.StartHealthLoop(ctx)
 	poolManager.RunHealthChecks(ctx)

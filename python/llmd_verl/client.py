@@ -92,16 +92,35 @@ class RolloutControllerClient:
 
     # --- Generation ---
 
-    def generate(self, prompt_token_ids: list[int], max_tokens: int = 32,
+    def generate(self, prompt: str | None = None,
+                 prompt_token_ids: list[int] | None = None,
+                 max_tokens: int = 32,
                  temperature: float = 0.7, **kwargs) -> dict:
+        """Generate a rollout via the controller.
+
+        Args:
+            prompt: Text prompt (used for inference router path — the router
+                tokenizes text for prefix-cache routing).
+            prompt_token_ids: Pre-tokenized prompt (used for direct engine
+                dispatch).
+            max_tokens: Maximum tokens to generate.
+            temperature: Sampling temperature.
+
+        Either prompt or prompt_token_ids must be provided.
+        """
         body: dict[str, Any] = {
-            "prompt_token_ids": prompt_token_ids,
             "sampling_params": {
                 "temperature": temperature,
                 "max_tokens": max_tokens,
                 **kwargs,
             },
         }
+        if prompt is not None:
+            body["prompt"] = prompt
+        elif prompt_token_ids is not None:
+            body["prompt_token_ids"] = prompt_token_ids
+        else:
+            raise ValueError("Must provide either prompt or prompt_token_ids")
         return self._post("/v1/generate", body)
 
     # --- Weight Management ---

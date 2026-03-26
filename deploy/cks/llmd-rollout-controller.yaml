@@ -1,8 +1,8 @@
-# Rollout controller for use with the llm-d inference stack (EPP + Gateway).
+# Rollout controller for use with the llm-d inference stack (router + gateway).
 #
 # Differences from rollout-controller.yaml:
-#   - --engine-selector uses llm-d.ai/inference-serving=true (matches EPP label)
-#   - --epp-url routes generation requests through the EPP gateway
+#   - --engine-selector uses llm-d.ai/inference-serving=true
+#   - --router-url routes generation requests through the inference router gateway
 #   - namespace: llm-d-rl
 ---
 apiVersion: v1
@@ -72,7 +72,7 @@ spec:
             - "--engine-selector=llm-d.ai/inference-serving=true"
             - "--engine-port=8000"
             - "--namespace=llm-d-rl"
-            - "--epp-url=http://llm-d-inference-gateway-istio.llm-d-rl.svc.cluster.local:80"
+            - "--router-url=http://llm-d-inference-gateway-istio.llm-d-rl.svc.cluster.local:80"
             - "--health-check-interval=15s"
           ports:
             - containerPort: 8090

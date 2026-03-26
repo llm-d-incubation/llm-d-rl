@@ -1,6 +1,6 @@
 # Deploying llm-d-rl with the llm-d Inference Stack
 
-This guide deploys llm-d-rl with the full llm-d inference scheduling stack (EPP + Gateway) for KV-cache-aware, load-aware routing of RL rollout generation requests.
+This guide deploys llm-d-rl with the full llm-d inference scheduling stack (inference router + gateway) for prefix-cache-aware, load-aware routing of RL rollout generation requests.
 
 All resources deploy into a single `llm-d-rl` namespace.
 
@@ -10,11 +10,11 @@ All resources deploy into a single `llm-d-rl` namespace.
 Trainer Job
   └─ POST /v1/generate
        └─ Rollout Controller
-            ├─ Generation: POST /v1/completions + X-Session-ID ──► Gateway ──► EPP ──► best vLLM pod
+            ├─ Generation: POST /v1/completions + X-Session-ID ──► Gateway ──► Inference Router ──► best vLLM pod
             └─ Weight sync: pause/update_weights/resume ──► each vLLM pod directly (by pod IP)
 ```
 
-The EPP (Endpoint Picker Plugin) selects the optimal vLLM pod for each request using KV-cache hit rate and load metrics. Weight sync operations always go directly to each pod.
+The inference router (llm-d inference scheduler) selects the optimal vLLM pod for each request using prefix-cache hit rate and load metrics. Weight sync operations always go directly to each pod.
 
 ## Prerequisites
 
@@ -47,7 +47,7 @@ kubectl -n llm-d-rl create secret generic llm-d-hf-token \
   --from-literal=HF_TOKEN=hf_YOUR_TOKEN
 ```
 
-### 2. Deploy EPP
+### 2. Deploy Inference Router
 
 ```bash
 kubectl apply -f deploy/cks/epp.yaml
@@ -55,7 +55,7 @@ kubectl -n llm-d-rl wait --for=condition=ready pod \
   -l app=llm-d-epp --timeout=300s
 ```
 
-This creates the EPP Deployment + Service (KV-cache-aware routing on port 9002). The first deploy may take a while as the image is pulled.
+This creates the inference router Deployment + Service (prefix-cache-aware routing on port 9002). The first deploy may take a while as the image is pulled.
 
 ### 3. Deploy Gateway + InferencePool
 
@@ -90,6 +90,13 @@ kubectl -n llm-d-rl wait --for=condition=ready pod \
 
 ### 6. Run a trainer job
 
+For the llm-d inference router path (text prompts for prefix-cache routing):
+```bash
+kubectl apply -f deploy/cks/trainer-job-text.yaml
+kubectl -n llm-d-rl logs -f job/nccl-trainer-text
+```
+
+For direct engine dispatch (token IDs):
 ```bash
 kubectl apply -f deploy/cks/trainer-job.yaml
 kubectl -n llm-d-rl logs -f job/nccl-trainer
@@ -101,10 +108,10 @@ kubectl -n llm-d-rl logs -f job/nccl-trainer
 # InferencePool exists
 kubectl get inferencepools -n llm-d-rl
 
-# vLLM pods discovered by EPP
+# vLLM pods discovered by inference router
 kubectl get pods -n llm-d-rl -l llm-d.ai/inference-serving=true
 
-# EPP running
+# Inference router running
 kubectl get pods -n llm-d-rl -l app=llm-d-epp
 
 # Gateway programmed
@@ -136,9 +143,9 @@ Edit `deploy/cks/gateway.yaml`, change the Gateway's `gatewayClassName`:
 - `kgateway`
 - `gke-l7-regional-external-managed` (GKE)
 
-And update the `--epp-url` in `deploy/cks/llmd-rollout-controller.yaml` to match the gateway service name (e.g., for kgateway the service name pattern differs from Istio's `{name}-istio`).
+And update the `--router-url` in `deploy/cks/llmd-rollout-controller.yaml` to match the gateway service name (e.g., for kgateway the service name pattern differs from Istio's `{name}-istio`).
 
-### Skip the EPP (direct dispatch)
+### Skip the inference router (direct dispatch)
 
 Use the original manifests instead:
 ```bash
@@ -146,7 +153,7 @@ kubectl apply -f deploy/cks/vllm-engine.yaml
 kubectl apply -f deploy/cks/rollout-controller.yaml
 ```
 
-These use `--engine-selector=llm-d-role=rollout-engine` and no `--epp-url` (round-robin direct dispatch).
+These use `--engine-selector=llm-d-role=rollout-engine` and no `--router-url` (round-robin direct dispatch).
 
 ## Architecture Overview
 
@@ -156,20 +163,20 @@ Inference requests flow through three layers:
 
 1. **Trainer Job** sends generation requests to the **Rollout Controller**
 2. The Rollout Controller forwards them to the **Gateway** (Istio Envoy proxy)
-3. The Gateway calls the **EPP** via gRPC to pick the best vLLM pod, then routes the request there
+3. The Gateway calls the **inference router** via gRPC to pick the best vLLM pod, then routes the request there
 
 Weight sync operations (pause/update_weights/resume) bypass the Gateway entirely — the Rollout Controller talks directly to each vLLM pod by IP.
 
-### vLLM Discovery (EPP)
+### vLLM Discovery (Inference Router)
 
-The EPP discovers vLLM pods dynamically through the Kubernetes **InferencePool** CRD:
+The inference router discovers vLLM pods dynamically through the Kubernetes **InferencePool** CRD:
 
 1. An `InferencePool` resource is created with a label selector (`llm-d.ai/inference-serving=true`)
-2. The EPP is pointed at this pool via `--pool-name` and `--pool-namespace`
-3. The EPP watches the Kubernetes API for pods matching the selector in that namespace
-4. As pods become Ready or are removed, the EPP's internal endpoint list updates automatically
+2. The router is pointed at this pool via `--pool-name` and `--pool-namespace`
+3. The router watches the Kubernetes API for pods matching the selector in that namespace
+4. As pods become Ready or are removed, the router's internal endpoint list updates automatically
 
-This means scaling vLLM (e.g., `kubectl scale statefulset/vllm-engine --replicas=4`) is picked up immediately — the EPP sees the new pods via its watch and starts routing to them with no restart or config change needed.
+This means scaling vLLM (e.g., `kubectl scale statefulset/vllm-engine --replicas=4`) is picked up immediately — the router sees the new pods via its watch and starts routing to them with no restart or config change needed.
 
 ### vLLM Discovery (Rollout Controller)
 
@@ -180,11 +187,11 @@ The Rollout Controller has its own independent discovery mechanism for weight sy
 3. On Delete or NotReady transitions, it fires `OnGone` to deregister the engine
 4. The **PoolManager** (`pkg/lifecycle`) receives these callbacks and maintains the live engine pool, running periodic health checks (every 30s) against each engine
 
-This dual-discovery design means the EPP handles inference routing (KV-cache-aware, load-aware) while the Rollout Controller independently tracks pods for direct weight sync operations.
+This dual-discovery design means the inference router handles request routing (prefix-cache-aware, load-aware) while the Rollout Controller independently tracks pods for direct weight sync operations.
 
 ### Scheduling Plugins
 
-The EPP uses a plugin chain to pick the optimal pod for each request:
+The inference router uses a plugin chain to pick the optimal pod for each request:
 
 - **prefix-cache-scorer** — scores pods by KV-cache prefix hit rate (weighted 2x)
 - **decode-filter** — filters out pods with high decode load
@@ -269,8 +276,9 @@ make fmt     # gofmt
 |---|---|
 | `deploy/llm-d/prereqs.sh` | CRDs + Istio (cluster-level) |
 | `deploy/cks/namespace.yaml` | Namespace |
-| `deploy/cks/epp.yaml` | EPP Deployment + Service |
+| `deploy/cks/epp.yaml` | Inference router Deployment + Service |
 | `deploy/cks/gateway.yaml` | InferencePool + Gateway + HTTPRoute |
 | `deploy/cks/llmd-vllm-engine.yaml` | vLLM with llm-d.ai labels + dev mode |
-| `deploy/cks/llmd-rollout-controller.yaml` | Rollout controller with EPP routing |
-| `deploy/cks/trainer-job.yaml` | Example NCCL weight trainer |
+| `deploy/cks/llmd-rollout-controller.yaml` | Rollout controller with router routing |
+| `deploy/cks/trainer-job.yaml` | NCCL weight trainer (token IDs, direct dispatch) |
+| `deploy/cks/trainer-job-text.yaml` | NCCL weight trainer (text prompts, router path) |
