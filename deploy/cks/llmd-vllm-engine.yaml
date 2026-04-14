@@ -33,7 +33,7 @@ metadata:
   namespace: llm-d-rl
 spec:
   serviceName: vllm-engine
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: vllm-engine
