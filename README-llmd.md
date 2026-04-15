@@ -16,6 +16,15 @@ Trainer Job
 
 The inference router (llm-d inference scheduler) selects the optimal vLLM pod for each request using prefix-cache hit rate and load metrics. Weight sync operations always go directly to each pod.
 
+### Pool design
+
+The rollout controller uses a single `EnginePool` for both concerns:
+
+- **Generation routing** — when `--router-url` is set, all `/v1/generate` requests are forwarded to the gateway. The controller never picks a pod for generation.
+- **Weight sync** — the controller's Kubernetes pod watcher independently discovers engine pods by label selector (`--engine-selector`) and talks directly to each one for pause/update_weights/resume.
+
+The two paths are decoupled: the gateway handles routing; the controller handles weight sync.
+
 ## Prerequisites
 
 ### Cluster-level (once per cluster)
@@ -55,7 +64,11 @@ kubectl -n llm-d-rl wait --for=condition=ready pod \
   -l app=llm-d-epp --timeout=300s
 ```
 
-This creates the inference router Deployment + Service (prefix-cache-aware routing on port 9002). The first deploy may take a while as the image is pulled.
+This creates:
+- ClusterRole + ClusterRoleBinding for the EPP service account (required to watch pods and InferencePools)
+- Inference router Deployment + Service (prefix-cache-aware routing on port 9002)
+
+The first deploy may take a while as the image is pulled.
 
 ### 3. Deploy Gateway + InferencePool
 
@@ -88,6 +101,14 @@ kubectl -n llm-d-rl wait --for=condition=ready pod \
   -l app=rollout-controller --timeout=120s
 ```
 
+Key flags used by `llmd-rollout-controller.yaml`:
+
+| Flag | Value | Purpose |
+|------|-------|---------|
+| `--engine-selector` | `llm-d.ai/inference-serving=true` | Kubernetes pod watch for weight sync |
+| `--router-url` | `http://llm-d-inference-gateway-istio.llm-d-rl.svc.cluster.local:80` | Gateway URL for generation routing |
+| `--tokens-in` | `false` (default) | Send text prompts; required for prefix-cache-aware routing via the gateway |
+
 ### 6. Run a trainer job
 
 For the llm-d inference router path (text prompts for prefix-cache routing):
@@ -96,7 +117,7 @@ kubectl apply -f deploy/cks/trainer-job-text.yaml
 kubectl -n llm-d-rl logs -f job/nccl-trainer-text
 ```
 
-For direct engine dispatch (token IDs):
+For direct engine dispatch (token IDs, no router):
 ```bash
 kubectl apply -f deploy/cks/trainer-job.yaml
 kubectl -n llm-d-rl logs -f job/nccl-trainer
@@ -117,7 +138,7 @@ kubectl get pods -n llm-d-rl -l app=llm-d-epp
 # Gateway programmed
 kubectl get gateway -n llm-d-rl
 
-# Rollout controller sees engines
+# Rollout controller sees engines (for weight sync)
 kubectl exec -n llm-d-rl deploy/rollout-controller -- \
   wget -qO- http://localhost:8090/v1/pool/status
 ```
@@ -136,6 +157,8 @@ Edit `deploy/cks/llmd-vllm-engine.yaml`:
 kubectl -n llm-d-rl scale statefulset/vllm-engine --replicas=4
 ```
 
+The rollout controller's pod watcher and the inference router both discover new pods automatically — no restart or config change needed.
+
 ### Use a different gateway controller
 
 Edit `deploy/cks/gateway.yaml`, change the Gateway's `gatewayClassName`:
@@ -143,7 +166,7 @@ Edit `deploy/cks/gateway.yaml`, change the Gateway's `gatewayClassName`:
 - `kgateway`
 - `gke-l7-regional-external-managed` (GKE)
 
-And update the `--router-url` in `deploy/cks/llmd-rollout-controller.yaml` to match the gateway service name (e.g., for kgateway the service name pattern differs from Istio's `{name}-istio`).
+And update `--router-url` in `deploy/cks/llmd-rollout-controller.yaml` to match the gateway service name (e.g., for kgateway the service name pattern differs from Istio's `{name}-istio`).
 
 ### Skip the inference router (direct dispatch)
 
@@ -153,7 +176,7 @@ kubectl apply -f deploy/cks/vllm-engine.yaml
 kubectl apply -f deploy/cks/rollout-controller.yaml
 ```
 
-These use `--engine-selector=llm-d-role=rollout-engine` and no `--router-url` (round-robin direct dispatch).
+These use `--engine-selector=llm-d-role=rollout-engine`, no `--router-url`, and `--tokens-in=true` (token ID arrays sent directly to vLLM).
 
 ## Architecture Overview
 
@@ -176,18 +199,16 @@ The inference router discovers vLLM pods dynamically through the Kubernetes **In
 3. The router watches the Kubernetes API for pods matching the selector in that namespace
 4. As pods become Ready or are removed, the router's internal endpoint list updates automatically
 
-This means scaling vLLM (e.g., `kubectl scale statefulset/vllm-engine --replicas=4`) is picked up immediately — the router sees the new pods via its watch and starts routing to them with no restart or config change needed.
+This means scaling vLLM (e.g., `kubectl scale statefulset/vllm-engine --replicas=4`) is picked up immediately — no restart or config change needed.
 
 ### vLLM Discovery (Rollout Controller)
 
 The Rollout Controller has its own independent discovery mechanism for weight sync operations:
 
-1. A **PodWatcher** (`pkg/discovery`) uses a Kubernetes informer with a label selector (e.g., `llm-d.ai/inference-serving=true`)
-2. On Add/Update events, it checks if the pod is Ready and has an IP — if so, it fires an `OnReady` callback with the pod's `http://{podIP}:8000` address
-3. On Delete or NotReady transitions, it fires `OnGone` to deregister the engine
-4. The **PoolManager** (`pkg/lifecycle`) receives these callbacks and maintains the live engine pool, running periodic health checks (every 30s) against each engine
-
-This dual-discovery design means the inference router handles request routing (prefix-cache-aware, load-aware) while the Rollout Controller independently tracks pods for direct weight sync operations.
+1. A **PodWatcher** (`pkg/discovery`) uses a Kubernetes informer with a label selector
+2. On Add/Update events, it checks if the pod is Ready and has an IP — if so, it calls `pool.AddEngine(id, address)`
+3. On Delete or NotReady transitions, it calls `pool.RemoveEngine(id)`
+4. The **EnginePool** (`pkg/pool`) receives these calls and maintains the live engine pool, running periodic health checks (every 15s by default)
 
 ### Scheduling Plugins
 
@@ -198,6 +219,15 @@ The inference router uses a plugin chain to pick the optimal pod for each reques
 - **max-score-picker** — picks the highest-scoring pod
 
 This is configured in the `epp-config` ConfigMap (`deploy/cks/epp.yaml`).
+
+### Prompt Format
+
+| Mode | `--tokens-in` | Prompt field sent | Used with |
+|------|--------------|-------------------|-----------|
+| Router (text) | `false` (default) | `"prompt": "<text>"` | `--router-url` + `trainer-job-text.yaml` |
+| Direct (tokens) | `true` | `"prompt_token_ids": [...]` | no `--router-url` + `trainer-job.yaml` |
+
+The gateway's inference router requires a text string in `"prompt"` for prefix-cache tokenization. Direct-to-vLLM accepts token ID arrays natively.
 
 ## Development
 
@@ -227,16 +257,15 @@ The Dockerfile always builds the `k8s` variant (with discovery support):
 
 ```bash
 # Build with auto-detected version tag
-make docker-build
+REGISTRY=quay.io/youruser/myrepo make docker-build
 
-# Push to registry
-make docker-push
-
-# Override registry or version
-REGISTRY=my-registry.io/my-org VERSION=v1.0.0 make docker-build docker-push
+# Tag as latest and push
+docker tag quay.io/youruser/myrepo/llm-d-rl:$(git describe --tags --always --dirty) \
+           quay.io/youruser/myrepo/llm-d-rl:latest
+docker push quay.io/youruser/myrepo/llm-d-rl:latest
 ```
 
-The image is built as a two-stage build: Go compilation on `golang:1.24-alpine`, final image on `distroless/static-debian12:nonroot` (minimal attack surface, ~5MB base).
+Update the image in `deploy/cks/llmd-rollout-controller.yaml` to match.
 
 ### Running Locally (without Kubernetes)
 
@@ -246,6 +275,7 @@ For development without a cluster, use the static engine list:
 make build
 ./bin/rollout-controller \
   --engines=http://localhost:8000 \
+  --tokens-in=true \
   --port=8090
 ```
 
@@ -259,6 +289,7 @@ make build-k8s
   --engine-selector="llm-d.ai/inference-serving=true" \
   --namespace=llm-d-rl \
   --kubeconfig=$HOME/.kube/config \
+  --router-url=http://llm-d-inference-gateway-istio.llm-d-rl.svc.cluster.local:80 \
   --port=8090
 ```
 
@@ -276,9 +307,9 @@ make fmt     # gofmt
 |---|---|
 | `deploy/llm-d/prereqs.sh` | CRDs + Istio (cluster-level) |
 | `deploy/cks/namespace.yaml` | Namespace |
-| `deploy/cks/epp.yaml` | Inference router Deployment + Service |
+| `deploy/cks/epp.yaml` | Inference router Deployment + Service + RBAC |
 | `deploy/cks/gateway.yaml` | InferencePool + Gateway + HTTPRoute |
 | `deploy/cks/llmd-vllm-engine.yaml` | vLLM with llm-d.ai labels + dev mode |
 | `deploy/cks/llmd-rollout-controller.yaml` | Rollout controller with router routing |
-| `deploy/cks/trainer-job.yaml` | NCCL weight trainer (token IDs, direct dispatch) |
 | `deploy/cks/trainer-job-text.yaml` | NCCL weight trainer (text prompts, router path) |
+| `deploy/cks/trainer-job.yaml` | NCCL weight trainer (token IDs, direct dispatch) |
