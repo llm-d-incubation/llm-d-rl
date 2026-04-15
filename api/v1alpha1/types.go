@@ -117,6 +117,9 @@ type GenerateResponse struct {
 
 	// FinishReason indicates why generation stopped.
 	FinishReason string `json:"finish_reason"` // "stop", "length", "abort"
+
+	// Text is the generated text returned by the engine or router.
+	Text string `json:"text,omitempty"`
 }
 
 // SamplingParams controls the generation sampling behavior.

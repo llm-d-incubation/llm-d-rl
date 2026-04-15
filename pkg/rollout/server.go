@@ -13,36 +13,22 @@ import (
 	"sync"
 
 	"github.com/llm-d/llm-d-rl/api/v1alpha1"
-	"github.com/llm-d/llm-d-rl/pkg/lifecycle"
-	"github.com/llm-d/llm-d-rl/pkg/weightsync"
+	"github.com/llm-d/llm-d-rl/pkg/pool"
 )
 
 // Server is the rollout controller HTTP server.
 // It exposes the RolloutControl API surface for RL training frameworks.
 type Server struct {
-	pool        *lifecycle.PoolManager
-	coordinator *weightsync.Coordinator
+	pool pool.Pool
 
-	// routerURL is the HTTP base URL of the inference router gateway (e.g.
-	// llm-d inference scheduler behind Envoy/Istio). When set, inference
-	// requests are forwarded here for prefix-cache-aware routing.
-	// When empty, requests are dispatched directly to an engine from the pool.
-	routerURL string
-
-	mu               sync.RWMutex
-	weightVersion    int64
-	cachedModelName  string // lazily populated on first /v1/models query
+	mu              sync.RWMutex
+	weightVersion   int64
+	cachedModelName string // lazily populated on first /v1/models query
 }
 
-// NewServer creates a new rollout controller server.
-// routerURL is the HTTP base URL of the inference router/gateway endpoint;
-// pass "" to use direct engine dispatch (fallback for local development).
-func NewServer(pool *lifecycle.PoolManager, coordinator *weightsync.Coordinator, routerURL string) *Server {
-	return &Server{
-		pool:        pool,
-		coordinator: coordinator,
-		routerURL:   routerURL,
-	}
+// NewServer creates a new rollout controller server backed by the given pool.
+func NewServer(p pool.Pool) *Server {
+	return &Server{pool: p}
 }
 
 // Handler returns an http.Handler with all rollout API routes registered.
@@ -78,29 +64,21 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var resp *v1alpha1.GenerateResponse
-	var err error
+	endpoint, err := s.pool.PickEngine()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("no endpoint available: %v", err), http.StatusServiceUnavailable)
+		return
+	}
 
-	if s.routerURL != "" {
-		// Route through the inference router gateway for prefix-cache-aware dispatch.
-		resp, err = s.forwardToRouter(r.Context(), &req)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("generate via router: %v", err), http.StatusBadGateway)
-			return
-		}
-	} else {
-		// Fallback: direct dispatch to a ready engine from the pool.
-		engine, pickErr := s.pool.PickReadyEngine()
-		if pickErr != nil {
-			http.Error(w, fmt.Sprintf("no engines available: %v", pickErr), http.StatusServiceUnavailable)
-			return
-		}
-		resp, err = s.forwardToEngine(r.Context(), engine, &req)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("generate: %v", err), http.StatusBadGateway)
-			return
-		}
-		resp.EngineID = engine.ID
+	headers := map[string]string{}
+	if req.SessionID != "" {
+		headers["X-Session-ID"] = req.SessionID
+	}
+
+	resp, err := s.postCompletions(r.Context(), endpoint, &req, headers, s.pool.TokensIn())
+	if err != nil {
+		http.Error(w, fmt.Sprintf("generate: %v", err), http.StatusBadGateway)
+		return
 	}
 
 	s.mu.RLock()
@@ -147,26 +125,16 @@ func (s *Server) discoverModelName(ctx context.Context, baseURL string) string {
 
 // buildOAIRequest constructs the OpenAI /v1/completions JSON body.
 //
-// The prompt format depends on which field is set in the GenerateRequest:
-//
-//   - req.Prompt (text string): sent as "prompt" for the inference router
-//     path. The llm-d inference scheduler tokenizes this text for
-//     prefix-cache-aware routing, then forwards to the engine.
-//
-//   - req.PromptTokenIDs (int array): sent as "prompt" for the direct
-//     engine path. vLLM's /v1/completions endpoint accepts token ID
-//     arrays natively.
-func (s *Server) buildOAIRequest(ctx context.Context, baseURL string, req *v1alpha1.GenerateRequest) ([]byte, error) {
+// When tokensIn is true, token IDs are sent in "prompt_token_ids".
+// When tokensIn is false, the text prompt is sent in "prompt".
+func (s *Server) buildOAIRequest(ctx context.Context, baseURL string, req *v1alpha1.GenerateRequest, tokensIn bool) ([]byte, error) {
 	oaiReq := map[string]interface{}{
 		"model": s.discoverModelName(ctx, baseURL),
 	}
-	if req.Prompt != "" {
-		// Router path: send the actual text prompt so the inference
-		// scheduler can tokenize it for prefix-cache routing.
-		oaiReq["prompt"] = req.Prompt
+	if tokensIn {
+		oaiReq["prompt_token_ids"] = req.PromptTokenIDs
 	} else {
-		// Direct-to-engine: vLLM accepts prompt as an int array natively.
-		oaiReq["prompt"] = req.PromptTokenIDs
+		oaiReq["prompt"] = req.Prompt
 	}
 	if req.SamplingParams != nil {
 		sp := req.SamplingParams
@@ -193,11 +161,13 @@ func (s *Server) buildOAIRequest(ctx context.Context, baseURL string, req *v1alp
 }
 
 // parseOAIResponse parses an OpenAI /v1/completions response body.
+// It always extracts output token IDs from the "token_ids" field.
 func parseOAIResponse(respBody []byte) (*v1alpha1.GenerateResponse, error) {
 	var oaiResp struct {
 		Choices []struct {
-			Text         string `json:"text"`
-			FinishReason string `json:"finish_reason"`
+			Text         string  `json:"text"`
+			TokenIDs     []int32 `json:"token_ids"`
+			FinishReason string  `json:"finish_reason"`
 			Logprobs     *struct {
 				TokenLogprobs []float32 `json:"token_logprobs"`
 			} `json:"logprobs"`
@@ -210,9 +180,8 @@ func parseOAIResponse(respBody []byte) (*v1alpha1.GenerateResponse, error) {
 	if len(oaiResp.Choices) > 0 {
 		choice := oaiResp.Choices[0]
 		resp.FinishReason = choice.FinishReason
-		for _, c := range choice.Text {
-			resp.OutputTokenIDs = append(resp.OutputTokenIDs, int32(c))
-		}
+		resp.OutputTokenIDs = choice.TokenIDs
+		resp.Text = choice.Text
 		if choice.Logprobs != nil {
 			resp.Logprobs = choice.Logprobs.TokenLogprobs
 		}
@@ -220,11 +189,10 @@ func parseOAIResponse(respBody []byte) (*v1alpha1.GenerateResponse, error) {
 	return resp, nil
 }
 
-// postCompletions is the shared implementation for both router and direct-engine
-// dispatch. It builds the OAI request body, POSTs to baseURL/v1/completions,
+// postCompletions builds the OAI request body, POSTs to baseURL/v1/completions,
 // applies any caller-supplied extra headers, and parses the response.
-func (s *Server) postCompletions(ctx context.Context, baseURL string, req *v1alpha1.GenerateRequest, extraHeaders map[string]string) (*v1alpha1.GenerateResponse, error) {
-	body, err := s.buildOAIRequest(ctx, baseURL, req)
+func (s *Server) postCompletions(ctx context.Context, baseURL string, req *v1alpha1.GenerateRequest, extraHeaders map[string]string, tokensIn bool) (*v1alpha1.GenerateResponse, error) {
+	body, err := s.buildOAIRequest(ctx, baseURL, req, tokensIn)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
@@ -255,25 +223,6 @@ func (s *Server) postCompletions(ctx context.Context, baseURL string, req *v1alp
 	return parseOAIResponse(respBody)
 }
 
-// forwardToRouter sends a GenerateRequest to the inference router gateway.
-// session_id is forwarded as X-Session-ID for KV-cache session affinity.
-// The request's Prompt field (text string) is used as the "prompt" value
-// so the inference scheduler can tokenize it for prefix-cache routing.
-func (s *Server) forwardToRouter(ctx context.Context, req *v1alpha1.GenerateRequest) (*v1alpha1.GenerateResponse, error) {
-	headers := map[string]string{}
-	if req.SessionID != "" {
-		headers["X-Session-ID"] = req.SessionID
-	}
-	return s.postCompletions(ctx, s.routerURL, req, headers)
-}
-
-// forwardToEngine sends a GenerateRequest directly to a vLLM engine.
-// The request's PromptTokenIDs are passed directly in "prompt" as an int
-// array, which vLLM accepts natively.
-func (s *Server) forwardToEngine(ctx context.Context, engine *lifecycle.EngineInfo, req *v1alpha1.GenerateRequest) (*v1alpha1.GenerateResponse, error) {
-	return s.postCompletions(ctx, engine.Address, req, nil)
-}
-
 func (s *Server) handleAbortGeneration(w http.ResponseWriter, r *http.Request) {
 	// TODO: Abort in-flight generation requests.
 	http.Error(w, "not yet implemented", http.StatusNotImplemented)
@@ -286,7 +235,7 @@ func (s *Server) handleInitWeightTransfer(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := s.coordinator.InitTransfer(r.Context(), &init); err != nil {
+	if err := s.pool.InitWeightTransfer(r.Context(), &init); err != nil {
 		http.Error(w, fmt.Sprintf("init weight transfer: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -305,7 +254,7 @@ func (s *Server) handleUpdateWeights(w http.ResponseWriter, r *http.Request) {
 	s.pool.SetPhase(v1alpha1.PoolPhaseSyncing)
 	defer s.pool.SetPhase(v1alpha1.PoolPhaseServing)
 
-	if err := s.coordinator.UpdateWeights(r.Context(), &req); err != nil {
+	if err := s.pool.UpdateWeights(r.Context(), &req); err != nil {
 		http.Error(w, fmt.Sprintf("update weights: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -338,7 +287,7 @@ func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.coordinator.PauseAll(r.Context(), req.Mode); err != nil {
+	if err := s.pool.PauseAll(r.Context(), req.Mode); err != nil {
 		http.Error(w, fmt.Sprintf("pause: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -348,7 +297,7 @@ func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
-	if err := s.coordinator.ResumeAll(r.Context()); err != nil {
+	if err := s.pool.ResumeAll(r.Context()); err != nil {
 		http.Error(w, fmt.Sprintf("resume: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -366,7 +315,7 @@ func (s *Server) handleSleep(w http.ResponseWriter, r *http.Request) {
 
 	s.pool.SetPhase(v1alpha1.PoolPhaseSleeping)
 
-	if err := s.coordinator.SleepAll(r.Context(), v1alpha1.SleepLevel(req.Level)); err != nil {
+	if err := s.pool.SleepAll(r.Context(), v1alpha1.SleepLevel(req.Level)); err != nil {
 		http.Error(w, fmt.Sprintf("sleep: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -382,7 +331,7 @@ func (s *Server) handleWakeUp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.coordinator.WakeUpAll(r.Context(), req.Tags); err != nil {
+	if err := s.pool.WakeUpAll(r.Context(), req.Tags); err != nil {
 		http.Error(w, fmt.Sprintf("wake up: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -395,7 +344,7 @@ func (s *Server) handleWakeUp(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePoolStatus(w http.ResponseWriter, r *http.Request) {
 	status := s.pool.Status()
-	status.WeightVersion = s.coordinator.WeightVersion()
+	status.WeightVersion = s.pool.WeightVersion()
 	json.NewEncoder(w).Encode(status)
 }
 
