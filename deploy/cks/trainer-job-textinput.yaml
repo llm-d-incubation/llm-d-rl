@@ -1,17 +1,33 @@
 # ConfigMap nccl-trainer-script is generated from python/nccl_weight_trainer.py.
-# Run: make generate-configmaps
+# Run: make generate-configmaps before applying this file.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nccl-trainer-text-prompts
+  namespace: llm-d-rl
+data:
+  prompts.txt: |
+    Explain the concept of prefix caching in LLM inference and why it matters for throughput.
+    What is the difference between prefill and decode phases in transformer inference?
+    Describe how KV cache works in autoregressive language model generation.
+    Write a Python function that implements binary search on a sorted array.
+    Explain the attention mechanism in transformer models and its computational complexity.
+    What are the trade-offs between model parallelism and data parallelism for LLM training?
+    Describe the RLHF pipeline for aligning large language models with human preferences.
+    How does speculative decoding improve inference latency without sacrificing quality?
 ---
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: nccl-trainer
+  name: nccl-trainer-text
   namespace: llm-d-rl
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: nccl-trainer
+        app: nccl-trainer-text
     spec:
       restartPolicy: Never
       containers:
@@ -23,6 +39,8 @@ spec:
             - "http://rollout-controller.llm-d-rl.svc.cluster.local:8090"
             - "--model-name"
             - "meta-llama/Llama-3.2-1B"
+            - "--prompt-file"
+            - "/prompts/prompts.txt"
             - "--num-steps"
             - "5"
           env:
@@ -44,6 +62,9 @@ spec:
             - name: trainer-script
               mountPath: /scripts
               readOnly: true
+            - name: prompts
+              mountPath: /prompts
+              readOnly: true
             - name: cache
               mountPath: /.cache
             - name: config
@@ -61,6 +82,9 @@ spec:
         - name: trainer-script
           configMap:
             name: nccl-trainer-script
+        - name: prompts
+          configMap:
+            name: nccl-trainer-text-prompts
         - name: cache
           emptyDir: {}
         - name: config

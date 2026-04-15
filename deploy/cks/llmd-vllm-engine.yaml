@@ -4,7 +4,7 @@
 # and probes from the llm-d-modelservice helm chart (inference-scheduling guide).
 #
 # Differences from vllm-engine.yaml:
-#   - Image: vllm/vllm-openai:latest (upstream vLLM)
+#   - Image: vllm/vllm-openai:v0.19.0 (upstream vLLM)
 #   - Labels: llm-d.ai/* labels matching the llm-d conventions
 #   - Command: vllm serve (llm-d convention)
 #   - Probes: /v1/models for startup/readiness (matches llm-d-modelservice)
@@ -51,7 +51,7 @@ spec:
       terminationGracePeriodSeconds: 130
       containers:
         - name: vllm
-          image: vllm/vllm-openai:latest
+          image: vllm/vllm-openai:v0.19.0
           imagePullPolicy: IfNotPresent
           command:
             - /bin/bash

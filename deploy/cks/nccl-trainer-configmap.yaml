@@ -1,40 +1,30 @@
 apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: nccl-trainer-text-prompts
-  namespace: llm-d-rl
-data:
-  prompts.txt: |
-    Explain the concept of prefix caching in LLM inference and why it matters for throughput.
-    What is the difference between prefill and decode phases in transformer inference?
-    Describe how KV cache works in autoregressive language model generation.
-    Write a Python function that implements binary search on a sorted array.
-    Explain the attention mechanism in transformer models and its computational complexity.
-    What are the trade-offs between model parallelism and data parallelism for LLM training?
-    Describe the RLHF pipeline for aligning large language models with human preferences.
-    How does speculative decoding improve inference latency without sacrificing quality?
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: nccl-trainer-text-script
-  namespace: llm-d-rl
 data:
   nccl_weight_trainer.py: |
-    """NCCL weight trainer for llm-d with text-prompt rollouts.
+    """NCCL weight trainer for the llm-d rollout controller.
 
-    This variant sends text prompts (not token IDs) to the rollout controller,
-    which is required when routing through the llm-d inference scheduler. The
-    scheduler tokenizes the text for prefix-cache-aware routing.
+    Supports two prompt modes:
 
-    Prompts are loaded from a file (one per line). If --prompt-file is not set
-    or the file is missing, a small built-in set of prompts is used.
+      Text mode (default): sends text strings to the rollout controller.
+        Required when routing through the llm-d inference scheduler (EPP + Gateway)
+        because the scheduler tokenises the text for prefix-cache-aware routing.
+
+      Token mode (--tokens-in): sends token-ID arrays directly to the controller.
+        Use when bypassing the gateway (direct dispatch, --tokens-in on the controller).
 
     Usage:
-        python nccl_weight_trainer.py \
-            --controller-url http://rollout-controller:8090 \
-            --model-name meta-llama/Llama-3.2-1B \
-            --prompt-file /prompts/prompts.txt \
+        # Text mode (router path)
+        python nccl_weight_trainer.py \\
+            --controller-url http://rollout-controller:8090 \\
+            --model-name meta-llama/Llama-3.2-1B \\
+            --prompt-file /prompts/prompts.txt \\
+            --num-steps 5
+
+        # Token-ID mode (direct dispatch)
+        python nccl_weight_trainer.py \\
+            --controller-url http://rollout-controller:8090 \\
+            --model-name meta-llama/Llama-3.2-1B \\
+            --tokens-in \\
             --num-steps 5
     """
 
@@ -56,10 +46,14 @@ data:
     log = logging.getLogger("nccl-trainer")
 
     DEFAULT_PROMPTS = [
-        "Explain the concept of prefix caching in LLM inference.",
-        "What is the difference between prefill and decode in transformer inference?",
+        "Explain the concept of prefix caching in LLM inference and why it matters for throughput.",
+        "What is the difference between prefill and decode phases in transformer inference?",
         "Describe how KV cache works in autoregressive language model generation.",
         "Write a Python function that implements binary search on a sorted array.",
+        "Explain the attention mechanism in transformer models and its computational complexity.",
+        "What are the trade-offs between model parallelism and data parallelism for LLM training?",
+        "Describe the RLHF pipeline for aligning large language models with human preferences.",
+        "How does speculative decoding improve inference latency without sacrificing quality?",
     ]
 
 
@@ -92,7 +86,7 @@ data:
         """Create NCCL communicator as rank 0 (trainer is master).
 
         Uses vLLM's StatelessProcessGroup which is independent of
-        torch.distributed -- the trainer's own distributed setup (if any)
+        torch.distributed — the trainer's own distributed setup (if any)
         is unaffected.
 
         Returns (pynccl_communicator, process_group).
@@ -195,7 +189,7 @@ data:
             })
 
         def update_weights(self, target_version: int, model: torch.nn.Module) -> dict:
-            """POST /v1/weights/update -- blocks until NCCL transfer completes."""
+            """POST /v1/weights/update — blocks until NCCL transfer completes."""
             names = []
             dtype_names = []
             shapes = []
@@ -212,18 +206,17 @@ data:
                 "param_shapes": shapes,
             })
 
-        def generate(self, prompt: str = None, prompt_token_ids: list[int] = None,
+        def generate(self, prompt: str | None = None,
+                     prompt_token_ids: list[int] | None = None,
                      max_tokens: int = 32) -> dict:
-            """POST /v1/generate with either text prompt or token IDs."""
-            body = {
-                "sampling_params": {"temperature": 0.7, "max_tokens": max_tokens},
-            }
+            """POST /v1/generate with either a text prompt or token IDs."""
+            if prompt is None and prompt_token_ids is None:
+                raise ValueError("Must provide either prompt or prompt_token_ids")
+            body: dict = {"sampling_params": {"temperature": 0.7, "max_tokens": max_tokens}}
             if prompt is not None:
                 body["prompt"] = prompt
-            elif prompt_token_ids is not None:
-                body["prompt_token_ids"] = prompt_token_ids
             else:
-                raise ValueError("Must provide either prompt or prompt_token_ids")
+                body["prompt_token_ids"] = prompt_token_ids
             return self._post("/v1/generate", body)
 
         def sleep(self, level: int = 2) -> dict:
@@ -246,7 +239,7 @@ data:
 
     def main():
         parser = argparse.ArgumentParser(
-            description="NCCL weight trainer for llm-d rollout controller (text prompt mode)",
+            description="NCCL weight trainer for the llm-d rollout controller",
         )
         parser.add_argument(
             "--controller-url", default="http://rollout-controller.llm-d-rl.svc.cluster.local:8090",
@@ -258,7 +251,11 @@ data:
         )
         parser.add_argument(
             "--prompt-file", default=None,
-            help="path to text file with prompts (one per line)",
+            help="path to text file with prompts (one per line); ignored when --tokens-in is set",
+        )
+        parser.add_argument(
+            "--tokens-in", action="store_true",
+            help="send dummy token-ID arrays instead of text prompts (use with direct dispatch, no --router-url)",
         )
         parser.add_argument(
             "--master-port", type=int, default=29500,
@@ -282,7 +279,13 @@ data:
 
         device = torch.device(args.device)
         client = ControllerClient(args.controller_url)
-        prompts = load_prompts(args.prompt_file)
+
+        prompts: list[str] = []
+        if not args.tokens_in:
+            prompts = load_prompts(args.prompt_file)
+            log.info("Prompt mode: text (%d prompts)", len(prompts))
+        else:
+            log.info("Prompt mode: token IDs (dummy)")
 
         # === STEP 1: Load model ===
         log.info("Loading model: %s", args.model_name)
@@ -341,9 +344,9 @@ data:
             raise RuntimeError(f"NCCL group setup failed: {nccl_error[0]}")
 
         pynccl, pg = nccl_result
-        log.info("NCCL group established -- engines joined")
+        log.info("NCCL group established — engines joined")
 
-        # === STEP 5: Training loop ===
+        # === STEP 4: Training loop ===
         weight_version = 0
 
         for step in range(1, args.num_steps + 1):
@@ -353,31 +356,35 @@ data:
             log.info("=" * 60)
             step_start = time.time()
 
-            # --- 5a. Generate a rollout (text prompt) ---
-            prompt_text = prompts[(step - 1) % len(prompts)]
-            log.info("[1/6] Generating rollout with text prompt: %s", prompt_text[:80])
-            resp = client.generate(prompt=prompt_text, max_tokens=16)
+            # --- 4a. Generate a rollout ---
+            log.info("[1/6] Generating rollout...")
+            if args.tokens_in:
+                resp = client.generate(prompt_token_ids=list(range(100, 120)), max_tokens=16)
+            else:
+                prompt_text = prompts[(step - 1) % len(prompts)]
+                log.info("  Prompt: %s", prompt_text[:80])
+                resp = client.generate(prompt=prompt_text, max_tokens=16)
             log.info("  Generated: finish_reason=%s, engine=%s, tokens=%d",
                      resp.get("finish_reason"), resp.get("engine_id"),
                      len(resp.get("output_token_ids", [])))
 
-            # --- 5b. Sleep engines ---
+            # --- 4b. Sleep engines ---
             log.info("[2/6] Sleeping engines (level=2)...")
             client.sleep(level=2)
             log.info("  GPU memory freed on engines")
 
-            # --- 5c. Perturb weights (simulate training step) ---
+            # --- 4c. Perturb weights (simulate training step) ---
             log.info("[3/6] Perturbing weights (simulating gradient step)...")
             with torch.no_grad():
                 for param in model.parameters():
                     param.data += torch.randn_like(param.data) * 0.001
 
-            # --- 5d. Wake engines (weights only) ---
+            # --- 4d. Wake engines (weights only) ---
             log.info("[4/6] Waking engines (weights only)...")
             client.wake_up(tags=["weights"])
             log.info("  Engine weight memory restored")
 
-            # --- 5e. Concurrent weight sync ---
+            # --- 4e. Concurrent weight sync ---
             #
             # The controller's POST /v1/weights/update calls vLLM's
             # POST /update_weights which starts an NCCL receive (blocks).
@@ -388,7 +395,7 @@ data:
             # is ready, so the ordering is safe.
 
             weight_version += 1
-            log.info("[5/6] Updating weights (version %d) -- concurrent NCCL broadcast...",
+            log.info("[5/6] Updating weights (version %d) — concurrent NCCL broadcast...",
                      weight_version)
 
             broadcast_error = [None]
@@ -413,7 +420,7 @@ data:
             if broadcast_error[0]:
                 raise RuntimeError(f"NCCL broadcast failed: {broadcast_error[0]}")
 
-            # --- 5f. Wake engines (KV cache) ---
+            # --- 4f. Wake engines (KV cache) ---
             log.info("[6/6] Waking engines (KV cache)...")
             client.wake_up(tags=["kv_cache"])
 
@@ -437,84 +444,8 @@ data:
 
     if __name__ == "__main__":
         main()
----
-apiVersion: batch/v1
-kind: Job
+kind: ConfigMap
 metadata:
-  name: nccl-trainer-text
+  creationTimestamp: null
+  name: nccl-trainer-script
   namespace: llm-d-rl
-spec:
-  backoffLimit: 0
-  template:
-    metadata:
-      labels:
-        app: nccl-trainer-text
-    spec:
-      restartPolicy: Never
-      containers:
-        - name: trainer
-          image: vllm/vllm-openai:latest
-          command: ["python3", "/scripts/nccl_weight_trainer.py"]
-          args:
-            - "--controller-url"
-            - "http://rollout-controller.llm-d-rl.svc.cluster.local:8090"
-            - "--model-name"
-            - "meta-llama/Llama-3.2-1B"
-            - "--prompt-file"
-            - "/prompts/prompts.txt"
-            - "--num-steps"
-            - "5"
-          env:
-            - name: NCCL_DEBUG
-              value: "INFO"
-            - name: HF_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: llm-d-hf-token
-                  key: HF_TOKEN
-                  optional: true
-            - name: HUGGING_FACE_HUB_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: llm-d-hf-token
-                  key: HF_TOKEN
-                  optional: true
-          volumeMounts:
-            - name: trainer-script
-              mountPath: /scripts
-              readOnly: true
-            - name: prompts
-              mountPath: /prompts
-              readOnly: true
-            - name: cache
-              mountPath: /.cache
-            - name: config
-              mountPath: /.config
-            - name: shm
-              mountPath: /dev/shm
-          resources:
-            limits:
-              nvidia.com/gpu: "1"
-            requests:
-              nvidia.com/gpu: "1"
-              memory: "32Gi"
-              cpu: "4"
-      volumes:
-        - name: trainer-script
-          configMap:
-            name: nccl-trainer-text-script
-        - name: prompts
-          configMap:
-            name: nccl-trainer-text-prompts
-        - name: cache
-          emptyDir: {}
-        - name: config
-          emptyDir: {}
-        - name: shm
-          emptyDir:
-            medium: Memory
-            sizeLimit: 20Gi
-      tolerations:
-        - key: "nvidia.com/gpu"
-          operator: "Exists"
-          effect: "NoSchedule"

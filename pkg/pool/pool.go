@@ -14,10 +14,11 @@ import (
 // Pool is the unified interface for an engine pool.
 // It owns both generation routing and weight synchronization.
 type Pool interface {
-	// PickEngine returns the base URL to send the next generation request to.
-	// If a router URL is configured it always returns that URL.
-	// Otherwise it returns the address of the first ready engine in the pool.
-	PickEngine() (string, error)
+	// PickEngine returns the base URL and engine ID for the next generation request.
+	// engineID is empty when a router URL is configured (EPP path) because the
+	// controller does not know which pod the router selected.
+	// In direct-dispatch mode engineID identifies the chosen engine pod.
+	PickEngine() (url string, engineID string, err error)
 
 	// TokensIn reports whether this pool expects token-ID arrays as input (true)
 	// or text strings (false). Callers use this to build the correct OAI request body.

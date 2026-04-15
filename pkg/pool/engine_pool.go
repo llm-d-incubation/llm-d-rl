@@ -92,18 +92,19 @@ func NewEnginePool(cfg Config) *EnginePool {
 // --- Pool interface: routing ---
 
 // PickEngine returns routerURL when configured; otherwise picks the first ready engine.
-func (p *EnginePool) PickEngine() (string, error) {
+// engineID is empty in router/EPP mode (the selected pod is unknown at this layer).
+func (p *EnginePool) PickEngine() (string, string, error) {
 	if p.routerURL != "" {
-		return p.routerURL, nil
+		return p.routerURL, "", nil
 	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	for _, es := range p.engines {
 		if es.ready {
-			return es.address, nil
+			return es.address, es.id, nil
 		}
 	}
-	return "", fmt.Errorf("no ready engines in pool")
+	return "", "", fmt.Errorf("no ready engines in pool")
 }
 
 // TokensIn reports whether this pool expects token-ID arrays as input.
@@ -120,6 +121,9 @@ func (p *EnginePool) AddEngine(id, address string) {
 		address: address,
 		client:  p.factory(address),
 	}
+	if p.transferInited {
+		log.Printf("pool: WARNING weight-transfer group invalidated — engine added id=%s addr=%s; call InitWeightTransfer before next UpdateWeights", id, address)
+	}
 	p.transferInited = false
 	log.Printf("pool: registered engine id=%s addr=%s", id, address)
 }
@@ -128,6 +132,9 @@ func (p *EnginePool) AddEngine(id, address string) {
 func (p *EnginePool) RemoveEngine(id string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.transferInited {
+		log.Printf("pool: WARNING weight-transfer group invalidated — engine removed id=%s; call InitWeightTransfer before next UpdateWeights", id)
+	}
 	delete(p.engines, id)
 	p.transferInited = false
 	log.Printf("pool: deregistered engine id=%s", id)
@@ -309,8 +316,9 @@ func (p *EnginePool) UpdateWeights(ctx context.Context, req *v1alpha1.WeightUpda
 func (p *EnginePool) PauseAll(ctx context.Context, mode v1alpha1.PauseMode) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if errs := fanOut(ctx, len(p.engines), func(ctx context.Context, i int) error {
-		return p.clientSlice()[i].Pause(ctx, mode)
+	clients := p.clientSlice() // capture once; map order is non-deterministic
+	if errs := fanOut(ctx, len(clients), func(ctx context.Context, i int) error {
+		return clients[i].Pause(ctx, mode)
 	}); len(errs) > 0 {
 		return fmt.Errorf("pause: %v", errs)
 	}

@@ -378,7 +378,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: trainer
-          image: vllm/vllm-openai:latest
+          image: vllm/vllm-openai:v0.19.0
           command: ["/bin/bash", "-c"]
           args:
             - |

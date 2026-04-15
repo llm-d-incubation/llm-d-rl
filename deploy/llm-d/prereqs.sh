@@ -17,11 +17,11 @@ GAIE_CRD_VERSION="${GAIE_CRD_VERSION:-v1.3.0}"
 ISTIO_VERSION="${ISTIO_VERSION:-1.28.1}"
 
 echo "=== Step 1: Gateway API CRDs (${GATEWAY_API_CRD_VERSION}) ==="
-kubectl apply -k "https://github.com/kubernetes-sigs/gateway-api/config/crd/?ref=${GATEWAY_API_CRD_VERSION}" || true
+kubectl apply -k "https://github.com/kubernetes-sigs/gateway-api/config/crd/?ref=${GATEWAY_API_CRD_VERSION}"
 
 echo ""
 echo "=== Step 2: Inference Extension CRDs (${GAIE_CRD_VERSION}) ==="
-kubectl apply -k "https://github.com/kubernetes-sigs/gateway-api-inference-extension/config/crd/?ref=${GAIE_CRD_VERSION}" || true
+kubectl apply -k "https://github.com/kubernetes-sigs/gateway-api-inference-extension/config/crd/?ref=${GAIE_CRD_VERSION}"
 
 echo ""
 echo "=== Step 3: Istio gateway controller (${ISTIO_VERSION}) ==="

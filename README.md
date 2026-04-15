@@ -170,7 +170,7 @@ kubectl apply -f deploy/cks/trainer-job.yaml
 kubectl -n llm-d-rl logs -f job/nccl-trainer
 
 # Text prompts — router path (requires llm-d inference stack, see README-llmd.md):
-kubectl apply -f deploy/cks/trainer-job-text.yaml
+kubectl apply -f deploy/cks/trainer-job-textinput.yaml
 kubectl -n llm-d-rl logs -f job/nccl-trainer-text
 ```
 

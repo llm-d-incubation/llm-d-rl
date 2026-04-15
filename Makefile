@@ -50,6 +50,17 @@ docker-build: ## Build container image
 docker-push: ## Push container image
 	docker push $(IMAGE):$(VERSION)
 
+##@ Deploy
+
+CONFIGMAP_OUT ?= deploy/cks/nccl-trainer-configmap.yaml
+
+.PHONY: generate-configmaps
+generate-configmaps: ## Generate ConfigMap YAML from python/nccl_weight_trainer.py (requires kubectl)
+	kubectl create configmap nccl-trainer-script \
+		--from-file=nccl_weight_trainer.py=python/nccl_weight_trainer.py \
+		--namespace=llm-d-rl \
+		--dry-run=client -o yaml > $(CONFIGMAP_OUT)
+
 ##@ Help
 
 .PHONY: help

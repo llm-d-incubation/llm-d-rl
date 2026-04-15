@@ -64,7 +64,7 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	endpoint, err := s.pool.PickEngine()
+	endpoint, engineID, err := s.pool.PickEngine()
 	if err != nil {
 		http.Error(w, fmt.Sprintf("no endpoint available: %v", err), http.StatusServiceUnavailable)
 		return
@@ -81,6 +81,7 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	resp.EngineID = engineID // empty in EPP mode; set in direct-dispatch mode
 	s.mu.RLock()
 	resp.WeightVersion = s.weightVersion
 	s.mu.RUnlock()

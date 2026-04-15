@@ -113,7 +113,7 @@ Key flags used by `llmd-rollout-controller.yaml`:
 
 For the llm-d inference router path (text prompts for prefix-cache routing):
 ```bash
-kubectl apply -f deploy/cks/trainer-job-text.yaml
+kubectl apply -f deploy/cks/trainer-job-textinput.yaml
 kubectl -n llm-d-rl logs -f job/nccl-trainer-text
 ```
 
@@ -224,7 +224,7 @@ This is configured in the `epp-config` ConfigMap (`deploy/cks/epp.yaml`).
 
 | Mode | `--tokens-in` | Prompt field sent | Used with |
 |------|--------------|-------------------|-----------|
-| Router (text) | `false` (default) | `"prompt": "<text>"` | `--router-url` + `trainer-job-text.yaml` |
+| Router (text) | `false` (default) | `"prompt": "<text>"` | `--router-url` + `trainer-job-textinput.yaml` |
 | Direct (tokens) | `true` | `"prompt_token_ids": [...]` | no `--router-url` + `trainer-job.yaml` |
 
 The gateway's inference router requires a text string in `"prompt"` for prefix-cache tokenization. Direct-to-vLLM accepts token ID arrays natively.
@@ -311,5 +311,5 @@ make fmt     # gofmt
 | `deploy/cks/gateway.yaml` | InferencePool + Gateway + HTTPRoute |
 | `deploy/cks/llmd-vllm-engine.yaml` | vLLM with llm-d.ai labels + dev mode |
 | `deploy/cks/llmd-rollout-controller.yaml` | Rollout controller with router routing |
-| `deploy/cks/trainer-job-text.yaml` | NCCL weight trainer (text prompts, router path) |
+| `deploy/cks/trainer-job-textinput.yaml` | NCCL weight trainer (text prompts, router path) |
 | `deploy/cks/trainer-job.yaml` | NCCL weight trainer (token IDs, direct dispatch) |

@@ -32,7 +32,7 @@ spec:
         kubernetes.io/hostname: gc3a4f4
       containers:
         - name: vllm
-          image: vllm/vllm-openai:latest
+          image: vllm/vllm-openai:v0.19.0
           ports:
             - containerPort: 8000
           env:
