@@ -59,10 +59,11 @@ spec:
       serviceAccountName: rollout-controller
       containers:
         - name: controller
-          image: ghcr.io/chcost/llm-d-rl:latest
+          image: quay.io/ezrasilvera/myrepo/llm-d-rl:latest
           args:
             - "--port=8090"
             - "--engines=http://vllm-engine-0.vllm-engine.llm-d-rl.svc.cluster.local:8000,http://vllm-engine-1.vllm-engine.llm-d-rl.svc.cluster.local:8000,http://vllm-engine-2.vllm-engine.llm-d-rl.svc.cluster.local:8000,http://vllm-engine-3.vllm-engine.llm-d-rl.svc.cluster.local:8000"
+            - "--tokens-in=true"
             - "--health-check-interval=15s"
           ports:
             - containerPort: 8090
