@@ -176,11 +176,15 @@ func parseOAIResponse(respBody []byte) (*v1alpha1.GenerateResponse, error) {
 	if err := json.Unmarshal(respBody, &oaiResp); err != nil {
 		return nil, fmt.Errorf("parse response: %w", err)
 	}
-	resp := &v1alpha1.GenerateResponse{}
+	resp := &v1alpha1.GenerateResponse{
+		OutputTokenIDs: []int32{}, // always an array, never null
+	}
 	if len(oaiResp.Choices) > 0 {
 		choice := oaiResp.Choices[0]
 		resp.FinishReason = choice.FinishReason
-		resp.OutputTokenIDs = choice.TokenIDs
+		if choice.TokenIDs != nil {
+			resp.OutputTokenIDs = choice.TokenIDs
+		}
 		resp.Text = choice.Text
 		if choice.Logprobs != nil {
 			resp.Logprobs = choice.Logprobs.TokenLogprobs
