@@ -1,35 +1,9 @@
 # Deploying llm-d-rl with py-inference-scheduler
 
-This guide deploys llm-d-rl with [py-inference-scheduler](https://github.com/llm-d-incubation/py-inference-scheduler) as the inference routing backend. It provides load-aware and KV-cache-aware routing without requiring the full llm-d Kubernetes stack (no Gateway API CRDs, no Istio, no InferencePool CRD).
+For background on router mode and a comparison with the llm-d EPP option,
+see [README-inference-router.md](README-inference-router.md).
 
 All resources deploy into the `llm-d-rl` namespace.
-
-## Architecture
-
-```
-Trainer Job
-  └─ POST /v1/generate
-       └─ Rollout Controller  (--router-url=http://py-is-server:8080)
-            ├─ Generation: POST /v1/completions ──► py-is Server ──► best vLLM pod
-            └─ Weight sync: pause/update_weights/resume ──► each vLLM pod (direct)
-```
-
-The py-is server is a separate pod that:
-1. Polls `GET /v1/pool/status` from the rollout controller every 5s to keep its engine list in sync
-2. Polls `GET /metrics` from each vLLM pod every 1s for KV cache and queue depth
-3. Uses the py-inference-scheduler scoring plugins to pick the best pod per request
-4. Proxies the `/v1/completions` request to the chosen pod
-
-Weight sync operations bypass the py-is server entirely — the rollout controller talks directly to each vLLM pod.
-
-## Comparison with the llm-d EPP stack
-
-| | py-is (this guide) | llm-d EPP ([README-llmd.md](README-llmd.md)) |
-|---|---|---|
-| **Routing** | py-inference-scheduler (Python) | EPP + Envoy Gateway (Go) |
-| **Prerequisites** | None beyond a K8s cluster | Gateway API CRDs + Istio |
-| **InferencePool CRD** | Not required | Required |
-| **Scheduling plugins** | waiting_queue + running_queue + kv_cache | prefix-cache + decode-filter |
 
 ## Prerequisites
 
@@ -69,23 +43,13 @@ This creates:
 
 ### 4. Deploy the rollout controller pointed at py-is
 
-Use `llmd-rollout-controller.yaml` as a base but swap the `--router-url` to point at the py-is server:
-
 ```bash
-kubectl apply -f deploy/cks/llmd-rollout-controller.yaml
-kubectl -n llm-d-rl patch deployment rollout-controller \
-  --type=json \
-  -p='[{"op":"replace","path":"/spec/template/spec/containers/0/args/4","value":"--router-url=http://py-is-server.llm-d-rl.svc.cluster.local:8080"}]'
+kubectl apply -f deploy/cks/rollout-controller-router-py-is.yaml
+kubectl -n llm-d-rl wait --for=condition=ready pod \
+  -l app=rollout-controller --timeout=120s
 ```
 
-Or edit `llmd-rollout-controller.yaml` locally and change:
-```yaml
-- "--router-url=http://llm-d-inference-gateway-istio.llm-d-rl.svc.cluster.local:80"
-```
-to:
-```yaml
-- "--router-url=http://py-is-server.llm-d-rl.svc.cluster.local:8080"
-```
+This uses `--router-url=http://py-is-server:8080` and `--tokens-in=true` (token IDs, since py-is scores on queue/KV metrics and does not need text prompts).
 
 ### 5. Run a trainer job
 

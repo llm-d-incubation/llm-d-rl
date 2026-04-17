@@ -1,9 +1,12 @@
-# Rollout controller for use with the llm-d inference stack (router + gateway).
+# Rollout controller — py-inference-scheduler router mode.
+#
+# Routes generation requests through the py-is scheduling proxy for
+# load-aware, KV-cache-aware routing. See README-py-is.md.
 #
 # Differences from rollout-controller.yaml:
-#   - --engine-selector uses llm-d.ai/inference-serving=true
-#   - --router-url routes generation requests through the inference router gateway
-#   - namespace: llm-d-rl
+#   - --engine-selector: llm-d-rl.io/role=rollout-engine (weight sync pod discovery)
+#   - --router-url: py-is server (picks best vLLM pod via queue/KV scoring)
+#   - --tokens-in=true: token IDs passed directly — py-is scores on metrics, not prompt text
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -69,10 +72,11 @@ spec:
           image: quay.io/ezrasilvera/myrepo/llm-d-rl:latest
           args:
             - "--port=8090"
-            - "--engine-selector=llm-d.ai/inference-serving=true"
+            - "--engine-selector=llm-d-rl.io/role=rollout-engine"
             - "--engine-port=8000"
             - "--namespace=llm-d-rl"
-            - "--router-url=http://llm-d-inference-gateway-istio.llm-d-rl.svc.cluster.local:80"
+            - "--router-url=http://py-is-server.llm-d-rl.svc.cluster.local:8080"
+            - "--tokens-in=true"
             - "--health-check-interval=15s"
           ports:
             - containerPort: 8090

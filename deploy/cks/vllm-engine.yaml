@@ -28,6 +28,7 @@ spec:
       labels:
         app: vllm-engine
         llm-d-role: rollout-engine
+        llm-d-rl.io/role: rollout-engine
     spec:
       containers:
         - name: vllm

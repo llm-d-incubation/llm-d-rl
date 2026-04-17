@@ -46,6 +46,7 @@ spec:
         llm-d.ai/accelerator-variant: gpu
         llm-d.ai/accelerator-vendor: nvidia
         llm-d.ai/model: Llama-3.2-1B
+        llm-d-rl.io/role: rollout-engine
     spec:
       enableServiceLinks: false
       terminationGracePeriodSeconds: 130

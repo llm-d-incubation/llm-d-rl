@@ -1,7 +1,7 @@
 PROJECT_NAME ?= llm-d-rl
 REGISTRY ?= ghcr.io/llm-d
 IMAGE ?= $(REGISTRY)/$(PROJECT_NAME)
-PY_IS_IMAGE ?= $(REGISTRY)/$(PROJECT_NAME)-py-is
+PY_IS_IMAGE ?= $(IMAGE)-py-is
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS ?= -s -w -X main.version=$(VERSION)
 
