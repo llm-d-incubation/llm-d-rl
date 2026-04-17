@@ -1,0 +1,21 @@
+# Default scheduler configuration for the py-is integration.
+#
+# Scores vLLM engines by waiting queue depth, running queue depth, and KV cache
+# utilization. Lower values are better for all three metrics. KV cache is weighted
+# 2x since it is the primary bottleneck for throughput during RL rollouts.
+#
+# This file is mounted into the py-is server pod via a ConfigMap.
+# Set ROUTER_CONFIG_PATH=/etc/scheduler/scheduler.yaml in the container.
+profile_handler:
+  type: single_profile
+profiles:
+  default:
+    scorers:
+      - type: waiting_queue
+        weight: 1.0
+      - type: running_queue
+        weight: 1.0
+      - type: kv_cache
+        weight: 2.0
+    picker:
+      type: max_score

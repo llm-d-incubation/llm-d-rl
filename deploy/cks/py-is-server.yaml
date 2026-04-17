@@ -1,0 +1,102 @@
+# py-inference-scheduler routing proxy for llm-d-rl.
+#
+# Deploys the py-is server as a standalone pod that sits between the rollout
+# controller and the vLLM engine pool. The rollout controller points
+# --router-url at this service; the py-is server picks the best vLLM pod
+# using load-aware and KV-cache-aware scoring.
+#
+# Usage:
+#   kubectl apply -f deploy/cks/py-is-server.yaml
+#
+# Then deploy the rollout controller with --router-url pointed here:
+#   --router-url=http://py-is-server.llm-d-rl.svc.cluster.local:8080
+#
+# See README-py-is.md for the full deployment guide.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: py-is-scheduler-config
+  namespace: llm-d-rl
+data:
+  scheduler.yaml: |
+    profile_handler:
+      type: single_profile
+    profiles:
+      default:
+        scorers:
+          - type: waiting_queue
+            weight: 1.0
+          - type: running_queue
+            weight: 1.0
+          - type: kv_cache
+            weight: 2.0
+        picker:
+          type: max_score
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: py-is-server
+  namespace: llm-d-rl
+  labels:
+    app: py-is-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: py-is-server
+  template:
+    metadata:
+      labels:
+        app: py-is-server
+    spec:
+      containers:
+        - name: py-is-server
+          image: quay.io/ezrasilvera/myrepo/llm-d-rl-py-is:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: ROLLOUT_CONTROLLER_URL
+              value: "http://rollout-controller.llm-d-rl.svc.cluster.local:8090"
+            - name: ROUTER_CONFIG_PATH
+              value: /etc/scheduler/scheduler.yaml
+          volumeMounts:
+            - name: scheduler-config
+              mountPath: /etc/scheduler
+          readinessProbe:
+            httpGet:
+              path: /v1/health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /v1/health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+      volumes:
+        - name: scheduler-config
+          configMap:
+            name: py-is-scheduler-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: py-is-server
+  namespace: llm-d-rl
+spec:
+  selector:
+    app: py-is-server
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

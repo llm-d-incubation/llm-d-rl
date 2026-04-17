@@ -1,6 +1,7 @@
 PROJECT_NAME ?= llm-d-rl
 REGISTRY ?= ghcr.io/llm-d
 IMAGE ?= $(REGISTRY)/$(PROJECT_NAME)
+PY_IS_IMAGE ?= $(REGISTRY)/$(PROJECT_NAME)-py-is
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS ?= -s -w -X main.version=$(VERSION)
 
@@ -43,12 +44,26 @@ generate: ## Generate protobuf and deepcopy code
 ##@ Container
 
 .PHONY: docker-build
-docker-build: ## Build container image
+docker-build: ## Build rollout controller container image
 	docker build -t $(IMAGE):$(VERSION) .
 
 .PHONY: docker-push
-docker-push: ## Push container image
+docker-push: ## Push rollout controller container image
 	docker push $(IMAGE):$(VERSION)
+
+.PHONY: docker-build-py-is
+docker-build-py-is: ## Build py-inference-scheduler proxy image
+	docker build -f integration/py-is/Dockerfile -t $(PY_IS_IMAGE):$(VERSION) .
+
+.PHONY: docker-push-py-is
+docker-push-py-is: ## Push py-inference-scheduler proxy image
+	docker push $(PY_IS_IMAGE):$(VERSION)
+
+.PHONY: docker-build-all
+docker-build-all: docker-build docker-build-py-is ## Build all container images
+
+.PHONY: docker-push-all
+docker-push-all: docker-push docker-push-py-is ## Push all container images
 
 ##@ Deploy
 
