@@ -6,7 +6,7 @@
 # Differences from rollout-controller.yaml:
 #   - --engine-selector: llm-d-rl.io/role=rollout-engine (weight sync pod discovery)
 #   - --router-url: py-is server (picks best vLLM pod via queue/KV scoring)
-#   - --tokens-in=true: token IDs passed directly — py-is scores on metrics, not prompt text
+#   - --tokens-in=false: text prompts forwarded through py-is to vLLM — py-is scores on metrics, not prompt content
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -76,7 +76,7 @@ spec:
             - "--engine-port=8000"
             - "--namespace=llm-d-rl"
             - "--router-url=http://py-is-server.llm-d-rl.svc.cluster.local:8080"
-            - "--tokens-in=true"
+            - "--tokens-in=false"
             - "--health-check-interval=15s"
           ports:
             - containerPort: 8090

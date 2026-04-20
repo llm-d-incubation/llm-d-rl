@@ -62,7 +62,7 @@ cluster does not have Gateway API CRDs and Istio installed.
 | | llm-d EPP | py-inference-scheduler |
 |---|---|---|
 | **Scheduling signal** | KV-cache prefix hit rate + decode load | Queue depth + KV cache utilization |
-| **Prompt format** | Text (`--tokens-in=false`) | Token IDs (`--tokens-in=true`) |
+| **Prompt format** | Text (`--tokens-in=false`) | Text (`--tokens-in=false`) |
 | **Infrastructure** | Gateway API CRDs + Istio + InferencePool CRD | None |
 | **Rollout controller manifest** | `rollout-controller-router-llmd.yaml` | `rollout-controller-router-py-is.yaml` |
 | **vLLM manifest** | `llmd-vllm-engine.yaml` | Either (`llmd-vllm-engine.yaml` or `vllm-engine.yaml`) |
