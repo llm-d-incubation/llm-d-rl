@@ -5,6 +5,12 @@ to the first ready vLLM engine in its pool. For production workloads you can ins
 point `--router-url` at an **inference router** — a dedicated scheduling layer that
 picks the optimal engine for each request based on live metrics.
 
+## Architecture
+
+![Inference Router mode architecture](docs/arch-router-mode.png)
+
+*[Edit diagram source](docs/arch-router-mode.drawio)*
+
 ## Why use a router
 
 Direct dispatch picks the first ready engine regardless of load. A router adds:
