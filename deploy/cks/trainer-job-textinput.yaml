@@ -1,21 +1,6 @@
-# ConfigMap nccl-trainer-script is generated from python/nccl_weight_trainer.py.
-# Run: make generate-configmaps before applying this file.
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: nccl-trainer-text-prompts
-  namespace: llm-d-rl
-data:
-  prompts.txt: |
-    Explain the concept of prefix caching in LLM inference and why it matters for throughput.
-    What is the difference between prefill and decode phases in transformer inference?
-    Describe how KV cache works in autoregressive language model generation.
-    Write a Python function that implements binary search on a sorted array.
-    Explain the attention mechanism in transformer models and its computational complexity.
-    What are the trade-offs between model parallelism and data parallelism for LLM training?
-    Describe the RLHF pipeline for aligning large language models with human preferences.
-    How does speculative decoding improve inference latency without sacrificing quality?
+# ConfigMaps are generated from python/ sources.
+# Run: make generate-configmaps && kubectl apply -f deploy/cks/nccl-trainer-configmap.yaml -f deploy/cks/nccl-trainer-prompts-configmap.yaml
+# Edit python/prompts.txt to customise prompts, then regenerate.
 ---
 apiVersion: batch/v1
 kind: Job

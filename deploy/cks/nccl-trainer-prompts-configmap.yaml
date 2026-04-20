@@ -1,0 +1,16 @@
+apiVersion: v1
+data:
+  prompts.txt: |
+    Explain the concept of prefix caching in LLM inference and why it matters for throughput.
+    What is the difference between prefill and decode phases in transformer inference?
+    Describe how KV cache works in autoregressive language model generation.
+    Write a Python function that implements binary search on a sorted array.
+    Explain the attention mechanism in transformer models and its computational complexity.
+    What are the trade-offs between model parallelism and data parallelism for LLM training?
+    Describe the RLHF pipeline for aligning large language models with human preferences.
+    How does speculative decoding improve inference latency without sacrificing quality?
+kind: ConfigMap
+metadata:
+  creationTimestamp: null
+  name: nccl-trainer-text-prompts
+  namespace: llm-d-rl

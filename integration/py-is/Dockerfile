@@ -2,17 +2,21 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# git is required by pip to install from a GitHub URL.
+# Install server dependencies and git (needed to clone py-inference-scheduler).
 RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install py-inference-scheduler (scheduling package only — no Ray required)
-# and the server dependencies.
 RUN pip install --no-cache-dir \
-    "git+https://github.com/llm-d-incubation/py-inference-scheduler.git" \
     "fastapi>=0.100" \
     "uvicorn[standard]>=0.20" \
     "httpx>=0.24"
+
+# Clone py-inference-scheduler and copy the scheduling package directly.
+# pip install via git+... only installs the top-level package (pyproject.toml
+# lists packages = ["scheduling"] without subpackages), so we clone and copy instead.
+RUN git clone --depth=1 https://github.com/llm-d-incubation/py-inference-scheduler.git /tmp/py-is \
+    && cp -r /tmp/py-is/scheduling /app/scheduling \
+    && rm -rf /tmp/py-is
 
 # Copy the integration source.
 COPY integration/py-is/ /app/
