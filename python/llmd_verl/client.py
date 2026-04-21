@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from typing import Any
 from urllib.error import HTTPError
@@ -17,6 +18,7 @@ from urllib.request import Request, urlopen
 from .config import LlmdRolloutConfig
 
 logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class RolloutControllerClient:
@@ -92,23 +94,12 @@ class RolloutControllerClient:
 
     # --- Generation ---
 
-    def generate(self, prompt: str | None = None,
-                 prompt_token_ids: list[int] | None = None,
-                 max_tokens: int = 32,
-                 temperature: float = 0.7, **kwargs) -> dict:
-        """Generate a rollout via the controller.
-
-        Args:
-            prompt: Text prompt (used for inference router path — the router
-                tokenizes text for prefix-cache routing).
-            prompt_token_ids: Pre-tokenized prompt (used for direct engine
-                dispatch).
-            max_tokens: Maximum tokens to generate.
-            temperature: Sampling temperature.
-
-        Either prompt or prompt_token_ids must be provided.
-        """
+    def generate(self, prompt_token_ids: list[int], max_tokens: int = 32,
+                 temperature: float = 0.7, prompt: str | None = None, **kwargs) -> dict:
         body: dict[str, Any] = {
+            "prompt_token_ids": prompt_token_ids,
+            "return_logprobs": True,
+            "return_token_ids": True,
             "sampling_params": {
                 "temperature": temperature,
                 "max_tokens": max_tokens,
@@ -117,10 +108,6 @@ class RolloutControllerClient:
         }
         if prompt is not None:
             body["prompt"] = prompt
-        elif prompt_token_ids is not None:
-            body["prompt_token_ids"] = prompt_token_ids
-        else:
-            raise ValueError("Must provide either prompt or prompt_token_ids")
         return self._post("/v1/generate", body)
 
     # --- Weight Management ---
@@ -132,7 +119,7 @@ class RolloutControllerClient:
             "master_address": master_address,
             "master_port": master_port,
             "trainer_world_size": world_size,
-            "packed": False,
+            "packed": self.config.use_packed,
             "is_checkpoint_format": True,
         })
 
@@ -141,7 +128,13 @@ class RolloutControllerClient:
                        param_dtypes: list[str] | None = None,
                        param_shapes: list[list[int]] | None = None,
                        pause_mode: str = "keep",
-                       reset_kv_cache: bool = True) -> dict:
+                       reset_kv_cache: bool = True,
+                       packed_buffer_size_bytes: int | None = None,
+                       packed_num_buffers: int = 2) -> dict:
+        """Trigger a weight update. When use_packed is True, the caller MUST pass
+        `packed_buffer_size_bytes` — this must equal the trainer's bucket_size so
+        both sides of the NCCL broadcast agree on buffer boundaries.
+        """
         body: dict[str, Any] = {
             "target_version": target_version,
             "pause_mode": pause_mode,
@@ -151,6 +144,15 @@ class RolloutControllerClient:
             body["param_names"] = param_names
             body["param_dtypes"] = param_dtypes or []
             body["param_shapes"] = param_shapes or []
+            body["packed"] = self.config.use_packed
+            if self.config.use_packed:
+                if packed_buffer_size_bytes is None:
+                    raise ValueError(
+                        "packed_buffer_size_bytes is required when use_packed=True; "
+                        "it must match the trainer checkpoint engine's bucket_size."
+                    )
+                body["packed_buffer_size_bytes"] = packed_buffer_size_bytes
+                body["packed_num_buffers"] = packed_num_buffers
         return self._post("/v1/weights/update", body)
 
     def update_weights_from_model(self, target_version: int, model) -> dict:
