@@ -1,0 +1,214 @@
+# ConfigMap containing the veRL Hydra configs for the one-step-off experiment.
+#
+# Mounted into head + worker pods at /etc/verl-configs (see ray-cluster-*.yaml).
+# Run training with:
+#   python -m verl.experimental.one_step_off_policy.main_ppo \
+#       --config-path /etc/verl-configs --config-name llm-d-config ...
+#
+# To update after editing configs:
+#   kubectl create configmap verl-configs -n llm-d-rl \
+#     --from-file=verl-config.yaml --from-file=llm-d-config.yaml \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#
+# Mounted files are resynced by kubelet within ~60s. Roll pods for immediate
+# effect:
+#   kubectl delete pods -l ray.io/cluster=verl-cluster
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: verl-configs
+  namespace: llm-d-rl
+data:
+  verl-config.yaml: |
+    hydra:
+      searchpath:
+        - file:///opt/verl/verl/trainer/config
+
+    defaults:
+      - ppo_trainer
+      - _self_
+
+    trainer:
+      use_legacy_worker_impl: disable # required for one-step-off
+      nnodes: 1
+      n_gpus_per_node: 2              # 2 training GPUs (FSDP, ~22GB/GPU for 3B full fine-tuning)
+      total_epochs: 1                 # 1 pass over data samples
+      project_name: verl-benchmark
+      experiment_name: gsm8k-grpo-3b-one-step-off-verl-vllm:17-4GPU
+      logger: ['console', 'wandb']
+      #logger: ['console']
+      test_freq: 20                    # validation
+      save_freq: -1                   # no checkpointing during benchmark
+      default_local_dir: /tmp/verl/checkpoints
+
+    # config for the rollout (only for resource isolation)
+    rollout:
+      nnodes: 1
+      n_gpus_per_node: 4   # 6 dedicated rollout GPUs, 1 replica each (TP=1)
+
+    actor_rollout_ref:
+      hybrid_engine: False  # required for one-step-off (separate training/rollout GPU pools)
+
+      model:
+        path: Qwen/Qwen2.5-3B-Instruct
+
+      actor:
+        ppo_mini_batch_size: 64         # number of prompts used for one gradient update (= train_batch_size, veRL convention)
+                                        # internally processes 64 × 16 = 1024 sequences per gradient step
+        ppo_micro_batch_size_per_gpu: 32 # prompts processed per GPU in a single forward+backward pass
+                                        # = ppo_mini_batch_size / n_gpus = 64/2 = 32 → no gradient accumulation (veRL convention)
+        ppo_epochs: 1                   # how many times to reuse the same rollout data for weight updates; 1 = on-policy, no reuse
+        use_rollout_log_probs: True     # reuse log probs computed during rollout instead of recomputing with actor
+        optim:
+          lr: 1e-6                      # learning rate; small value for full fine-tuning stability (ref: DeepSeek-R1 used 1e-6 for 7B)
+
+      rollout:
+        name: vllm                     # rollout engine
+        mode: async                    # required for one-step-off
+        n: 16                          # responses per prompt for GRPO group advantage estimation
+        dtype: bfloat16
+        load_format: auto
+        free_cache_engine: False       # required for weight sync
+        calculate_log_probs: True      # required for one-step-off bypass_mode
+        gpu_memory_utilization: 0.85   # matches llmd vLLM pod setting (--gpu-memory-utilization 0.85)
+        tensor_model_parallel_size: 1  # TP=1, 1 GPU per replica
+        log_prob_micro_batch_size_per_gpu: 32  # micro batch for log prob computation during rollout
+
+        checkpoint_engine:
+          backend: "nccl"
+          update_weights_bucket_megabytes: 2048  # veRL default; match llm-d-config for fair weight-sync comparison
+
+    data:
+      train_files: /tmp/verl/data/gsm8k/train.parquet
+      val_files: /tmp/verl/data/gsm8k/test.parquet
+      train_batch_size: 64   # 64 prompts × group_size=16 = 1024 concurrent requests per step
+      val_batch_size: 64     # = train_batch_size (veRL convention), limits concurrent reward computations during validation
+      shuffle: False         # fixed order for reproducibility across runs
+      max_prompt_length: 1024
+      max_response_length: 1024
+
+    algorithm:
+      adv_estimator: grpo             # GRPO advantage estimator (group relative policy optimization)
+      kl_penalty: kl                  # KL divergence penalty type
+      kl_ctrl:
+        type: fixed
+        kl_coef: 0.001                # small KL penalty to prevent policy from drifting too far from reference
+      use_kl_in_reward: False         # don't add KL to reward signal (standard GRPO)
+      rollout:
+        n: 16                         # group size: 16 responses per prompt for GRPO advantage estimation
+      rollout_correction:
+        bypass_mode: True             # use rollout log probs directly, no recomputation
+
+    ray_kwargs:
+      ray_init:
+        runtime_env:
+          env_vars:
+            PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"  # required when vLLM runs inside Ray worker (CuMemAllocator incompatible with True)
+
+  llm-d-config.yaml: |
+    hydra:
+      searchpath:
+        - file:///opt/verl/verl/trainer/config
+
+    defaults:
+      - ppo_trainer
+      - _self_
+
+    trainer:
+      use_legacy_worker_impl: disable # required for one-step-off
+      nnodes: 1
+      n_gpus_per_node: 2              # 2 training GPUs (FSDP, ~22GB/GPU for 3B full fine-tuning)
+      total_epochs: 1                 # 1 pass over data samples
+      project_name: verl-benchmark
+      experiment_name: gsm8k-grpo-3b-one-step-off-llmd-4GPU-noepp
+      logger: ['console', 'wandb']
+      #logger: ['console']
+      test_freq: 20                   # validation frequency
+      save_freq: -1                   # no checkpointing during benchmark
+      default_local_dir: /tmp/verl/checkpoints
+
+    # llmd owns rollout externally — no rollout GPU pool needed in Ray
+    rollout:
+      nnodes: 1
+      n_gpus_per_node: 1              # minimal placeholder (llmd pods handle actual inference)
+
+    actor_rollout_ref:
+      hybrid_engine: False  # required for one-step-off (separate training/rollout GPU pools)
+
+      model:
+        path: Qwen/Qwen2.5-3B-Instruct
+
+      actor:
+        ppo_mini_batch_size: 64         # number of prompts used for one gradient update (= train_batch_size, veRL convention)
+                                        # internally processes 64 × 16 = 1024 sequences per gradient step
+        ppo_micro_batch_size_per_gpu: 32 # prompts processed per GPU in a single forward+backward pass
+                                        # = ppo_mini_batch_size / n_gpus = 64/2 = 32 → no gradient accumulation (veRL convention)
+        ppo_epochs: 1                   # how many times to reuse the same rollout data for weight updates; 1 = on-policy, no reuse
+        use_rollout_log_probs: True     # reuse log probs computed during rollout instead of recomputing with actor
+        optim:
+          lr: 1e-6                      # learning rate; small value for full fine-tuning stability (ref: DeepSeek-R1 used 1e-6 for 7B)
+
+      rollout:
+        # ── llm-d plugin hooks ────────────────────────────────────────────────────
+        checkpoint_manager_class: llmd_verl.checkpoint_engine_manager.LlmdVerlCheckpointEngineManager
+        agent:
+          agent_loop_manager_class: llmd_verl.agent_loop_manager.LlmdAgentLoopManager
+        custom:
+          llmd:
+            controller_url: ${oc.env:LLMD_CONTROLLER_URL,http://localhost:8090}
+            http_timeout_s: 600.0
+
+        # ── Sampling parameters (identical to verl-baseline) ─────────────────────
+        n: 16                          # responses per prompt for GRPO group advantage estimation
+        free_cache_engine: False       # required for weight sync
+        calculate_log_probs: True      # required for one-step-off bypass_mode
+        tensor_model_parallel_size: 1  # TP=1, 1 GPU per replica
+        log_prob_micro_batch_size_per_gpu: 32
+
+        # ── Checkpoint engine (NCCL weight broadcast to llm-d vLLM pods) ─────────
+        checkpoint_engine:
+          _target_: verl.workers.config.CheckpointEngineConfig
+          backend: llmd
+          custom_backend_module: llmd_verl.checkpoint_engine
+          update_weights_bucket_megabytes: 2048
+          engine_kwargs:
+            llmd:
+              controller_url: ${oc.env:LLMD_CONTROLLER_URL,http://localhost:8090}
+              http_timeout_s: 600.0
+
+        # ── Unused rollout-server settings (llm-d owns inference GPUs) ───────────
+        name: vllm
+        mode: async
+        dtype: bfloat16
+        gpu_memory_utilization: 0.0    # llm-d owns inference GPUs
+        load_format: dummy             # no weights loaded in Ray worker
+
+
+    data:
+      train_files: /tmp/verl/data/gsm8k/train.parquet
+      val_files: /tmp/verl/data/gsm8k/test.parquet
+      train_batch_size: 64   # 64 prompts × group_size=16 = 1024 concurrent requests per step
+      val_batch_size: 64     # = train_batch_size (veRL convention), limits concurrent reward computations during validation
+                             # split across llmd rollout replicas
+                             # 992 samples / 64 = 15 steps per epoch (13 after warmup)
+      shuffle: False         # fixed order for reproducibility across runs
+      max_prompt_length: 1024
+      max_response_length: 1024
+
+    algorithm:
+      adv_estimator: grpo             # GRPO advantage estimator (group relative policy optimization)
+      kl_penalty: kl                  # KL divergence penalty type
+      kl_ctrl:
+        type: fixed
+        kl_coef: 0.001                # small KL penalty to prevent policy from drifting too far from reference
+      use_kl_in_reward: False         # don't add KL to reward signal (standard GRPO)
+      rollout:
+        n: 16                         # group size: 16 responses per prompt for GRPO advantage estimation
+      rollout_correction:
+        bypass_mode: True             # use rollout log probs from llm-d (return_logprobs: True in client)
+
+    ray_kwargs:
+      ray_init:
+        runtime_env:
+          env_vars:
+            PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"  # safe to use True — no vLLM running inside Ray worker

@@ -1,0 +1,169 @@
+# vLLM engine for use with the llm-d inference stack (EPP + Gateway).
+#
+# Uses vllm/vllm-openai (upstream vLLM image) and matches the labels
+# and probes from the llm-d-modelservice helm chart (inference-scheduling guide).
+#
+# Differences from vllm-engine.yaml:
+#   - Image: vllm/vllm-openai:latest (upstream vLLM)
+#   - Labels: llm-d.ai/* labels matching the llm-d conventions
+#   - Command: vllm serve (llm-d convention)
+#   - Probes: /v1/models for startup/readiness (matches llm-d-modelservice)
+#   - Volumes: /dev/shm, /data, /.config, /.cache (matches llm-d-modelservice)
+#   - preStop lifecycle hook for graceful shutdown
+#   - VLLM_SERVER_DEV_MODE + weight-transfer-config for llm-d-rl weight sync
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-engine
+  namespace: llm-d-rl
+spec:
+  clusterIP: None
+  selector:
+    app: vllm-engine
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: vllm-engine
+  namespace: llm-d-rl
+spec:
+  serviceName: vllm-engine
+  replicas: 4
+  selector:
+    matchLabels:
+      app: vllm-engine
+  template:
+    metadata:
+      labels:
+        app: vllm-engine
+        llm-d.ai/inference-serving: "true"
+        llm-d.ai/role: decode
+        llm-d.ai/accelerator-variant: gpu
+        llm-d.ai/accelerator-vendor: nvidia
+        llm-d.ai/model: "Qwen-Qwen2.5-3B-Instruct"
+    spec:
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 130
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.17.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -c
+          args:
+            - |
+              exec vllm serve Qwen/Qwen2.5-3B-Instruct \
+                --port 8000 \
+                --dtype bfloat16 \
+                --load-format auto \
+                --distributed-executor-backend mp \
+                --max-model-len 32768 \
+                --gpu-memory-utilization 0.85 \
+                --tensor-parallel-size 1 \
+                --max-num-seqs 1024 \
+                --enable-chunked-prefill \
+                --max-num-batched-tokens 8192 \
+                --enable-prefix-caching \
+                --seed 0 \
+                --scheduling-policy fcfs \
+                --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+                --override-generation-config '{"temperature": 1.0, "top_k": -1, "top_p": 1, "repetition_penalty": 1.0, "max_new_tokens": 2048}' \
+                --disable-uvicorn-access-log \
+                --weight-transfer-config '{"backend":"nccl"}'
+          env:
+            - name: NCCL_DEBUG
+              value: "INFO"
+            - name: VLLM_SERVER_DEV_MODE
+              value: "1"
+            - name: VLLM_LOGGING_LEVEL
+              value: "DEBUG"
+            - name: VLLM_NCCL_SO_PATH
+              value: "/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2"
+            - name: TRITON_CACHE_DIR
+              value: /tmp/triton
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: llm-d-hf-token
+                  key: HF_TOKEN
+                  optional: true
+          ports:
+            - containerPort: 8000
+              name: http
+              protocol: TCP
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 30
+          startupProbe:
+            httpGet:
+              path: /v1/models
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 120
+          readinessProbe:
+            httpGet:
+              path: /v1/models
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+            requests:
+              nvidia.com/gpu: "1"
+              memory: "32Gi"
+              cpu: "4"
+          volumeMounts:
+            - mountPath: /data
+              name: data
+            - mountPath: /dev/shm
+              name: shm
+            - mountPath: /.config
+              name: metrics-volume
+            - mountPath: /.cache
+              name: torch-compile-cache
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 20Gi
+        - name: metrics-volume
+          emptyDir: {}
+        - name: torch-compile-cache
+          emptyDir: {}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - pokprod-b93r44s2  # node with incompatible vLLM version
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                - pokprod-b93r38s3  # restrict to specific node(s)
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
