@@ -59,7 +59,16 @@ func (c *VLLMClient) UpdateWeights(ctx context.Context, req *v1alpha1.WeightUpda
 		"names":       req.ParamNames,
 		"dtype_names": req.ParamDtypes,
 		"shapes":      req.ParamShapes,
-		"packed":      false,
+		"packed":      req.Packed,
+	}
+	// Add packed buffer params if packed mode is enabled
+	if req.Packed {
+		if req.PackedBufferSizeBytes > 0 {
+			updateInfo["packed_buffer_size_bytes"] = req.PackedBufferSizeBytes
+		}
+		if req.PackedNumBuffers > 0 {
+			updateInfo["packed_num_buffers"] = req.PackedNumBuffers
+		}
 	}
 	body := map[string]interface{}{
 		"update_info": updateInfo,
