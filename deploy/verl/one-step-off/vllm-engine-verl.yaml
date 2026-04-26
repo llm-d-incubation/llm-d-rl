@@ -1,16 +1,14 @@
-# vLLM engine for use with the llm-d inference stack (EPP + Gateway).
+# vLLM engine for llm-d (same Service/StatefulSet shell as deploy/cks/llmd-vllm-engine.yaml:
+# labels, probes, volumes, preStop, VLLM_SERVER_DEV_MODE, weight-transfer-config).
 #
-# Uses vllm/vllm-openai (upstream vLLM image) and matches the labels
-# and probes from the llm-d-modelservice helm chart (inference-scheduling guide).
-#
-# Differences from vllm-engine.yaml:
-#   - Image: vllm/vllm-openai:latest (upstream vLLM)
-#   - Labels: llm-d.ai/* labels matching the llm-d conventions
-#   - Command: vllm serve (llm-d convention)
-#   - Probes: /v1/models for startup/readiness (matches llm-d-modelservice)
-#   - Volumes: /dev/shm, /data, /.config, /.cache (matches llm-d-modelservice)
-#   - preStop lifecycle hook for graceful shutdown
-#   - VLLM_SERVER_DEV_MODE + weight-transfer-config for llm-d-rl weight sync
+# Differences from deploy/cks/llmd-vllm-engine.yaml — veRL-oriented `vllm serve` only:
+#   - Throughput / latency tuning: --dtype, longer --max-model-len, --distributed-executor-backend,
+#     --max-num-seqs, --enable-chunked-prefill, --max-num-batched-tokens, --enable-prefix-caching,
+#     --scheduling-policy, --compilation-config (cudagraph), --tensor-parallel-size.
+#   - Default sampling for rollout: --override-generation-config (temperature, top_k, top_p,
+#     repetition_penalty, max_new_tokens) to match typical veRL configs.
+#   - Debug / NCCL env: NCCL_DEBUG, VLLM_LOGGING_LEVEL, VLLM_NCCL_SO_PATH (trim for production).
+#   - Optional commented node affinity under spec.template.spec for co-location with Ray.
 ---
 apiVersion: v1
 kind: Service
@@ -150,19 +148,22 @@ spec:
           emptyDir: {}
         - name: torch-compile-cache
           emptyDir: {}
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-            - matchExpressions:
-              - key: kubernetes.io/hostname
-                operator: NotIn
-                values:
-                - pokprod-b93r44s2  # node with incompatible vLLM version
-              - key: kubernetes.io/hostname
-                operator: In
-                values:
-                - pokprod-b93r38s3  # restrict to specific node(s)
+      # Co-locate vLLM with Ray trainer workers and the llm-d rollout controller on the
+      # same node(s) when possible for faster NCCL weight sync and lower HTTP latency.
+      # Uncomment affinity to pin nodes.
+      # affinity:
+      #   nodeAffinity:
+      #     requiredDuringSchedulingIgnoredDuringExecution:
+      #       nodeSelectorTerms:
+      #       - matchExpressions:
+      #         - key: kubernetes.io/hostname
+      #           operator: NotIn
+      #           values:
+      #           - bad-node-hostname
+      #         - key: kubernetes.io/hostname
+      #           operator: In
+      #           values:
+      #           - your-node-hostname
       tolerations:
         - key: "nvidia.com/gpu"
           operator: "Exists"

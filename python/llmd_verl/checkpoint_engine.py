@@ -40,7 +40,7 @@ def _get_local_ip() -> str:
     return socket.gethostbyname(hostname)
 
 
-class BroadcastOperation:
+class _BroadcastOperation:
     """Async NCCL broadcast running in a background thread (like veRL).
 
     Starts the broadcast immediately in an executor so the event loop
@@ -225,7 +225,7 @@ class LlmdNcclCheckpointEngine(CheckpointEngine):
 
             iterator = iter(weights)
             num_buckets = 0
-            broadcast_op: BroadcastOperation | None = None
+            broadcast_op: _BroadcastOperation | None = None
 
             while True:
                 bucket_tensors: list[torch.Tensor] = []
@@ -268,10 +268,12 @@ class LlmdNcclCheckpointEngine(CheckpointEngine):
                         "[LLMD NCCL] packed: bucket #%d, size=%.1fMB, tensors so far=%d",
                         num_buckets, bucket_size / 1e6, count,
                     )
-                    # Wait for previous broadcast before starting next (overlap pack with broadcast)
+                    # Finish the prior broadcast before launching the next.
+                    # Each _BroadcastOperation starts NCCL in a thread; the next outer-loop
+                    # iteration can pack the following bucket while that broadcast runs.
                     if broadcast_op is not None:
                         await broadcast_op.wait_for_complete()
-                    broadcast_op = BroadcastOperation(self._pynccl, packed, stream)
+                    broadcast_op = _BroadcastOperation(self._pynccl, packed, stream)
 
                 if done:
                     # Wait for final broadcast
@@ -282,8 +284,8 @@ class LlmdNcclCheckpointEngine(CheckpointEngine):
             mode_str = f"in {num_buckets} buckets (packed)"
 
         else:
-            # ===== NON-PACKED MODE: one tensor per broadcast, overlapped =====
-            broadcast_op: BroadcastOperation | None = None
+            # ===== NON-PACKED MODE: one tensor per broadcast (same overlap pattern) =====
+            broadcast_op: _BroadcastOperation | None = None
             for name, tensor in weights:
                 if self._cached_metadata is None:
                     names.append(name)
@@ -298,10 +300,12 @@ class LlmdNcclCheckpointEngine(CheckpointEngine):
                 if not weight.is_cuda:
                     weight = weight.cuda()
 
-                # Overlap: wait for previous broadcast, start next
+                # Await prior broadcast before starting the next.
+                # The new _BroadcastOperation runs in a thread; the next for-loop iteration
+                # (generator / AllGather / contiguous / cuda) overlaps with it.
                 if broadcast_op is not None:
                     await broadcast_op.wait_for_complete()
-                broadcast_op = BroadcastOperation(self._pynccl, weight, stream)
+                broadcast_op = _BroadcastOperation(self._pynccl, weight, stream)
 
                 count += 1
                 if count % 50 == 0:

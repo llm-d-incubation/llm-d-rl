@@ -35,8 +35,7 @@ data:
       total_epochs: 1                 # 1 pass over data samples
       project_name: verl-benchmark
       experiment_name: gsm8k-grpo-3b-one-step-off-verl-vllm:17-4GPU
-      logger: ['console', 'wandb']
-      #logger: ['console']
+      logger: ['console']
       test_freq: 20                    # validation
       save_freq: -1                   # no checkpointing during benchmark
       default_local_dir: /tmp/verl/checkpoints
@@ -121,8 +120,7 @@ data:
       total_epochs: 1                 # 1 pass over data samples
       project_name: verl-benchmark
       experiment_name: gsm8k-grpo-3b-one-step-off-llmd-4GPU-noepp
-      logger: ['console', 'wandb']
-      #logger: ['console']
+      logger: ['console']
       test_freq: 20                   # validation frequency
       save_freq: -1                   # no checkpointing during benchmark
       default_local_dir: /tmp/verl/checkpoints

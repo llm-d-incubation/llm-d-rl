@@ -188,6 +188,8 @@ class LlmdVerlCheckpointEngineManager:
                 ["prepare"] * self.trainer.world_size
             ),
         )
+        if not metadata:
+            raise RuntimeError("trainer.prepare() returned empty metadata")
         master_meta = metadata[0]   # {"master_address": "10.x.x.x", "master_port": 29500}
 
         # 2. Query controller for how many vLLM pods exist

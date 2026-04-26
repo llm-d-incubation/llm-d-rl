@@ -5,7 +5,7 @@ A drop-in plugin that lets [veRL](https://github.com/volcengine/verl) use
 veRL's own Ray-managed vLLM processes.
 
 Training (FSDP + PPO/GRPO) still runs as normal Ray actors on GPUs.
-Inference (generation + KV cache) runs in **dedicated llm-d vLLM pods**,
+Inference runs in **dedicated llm-d vLLM pods**,
 load-balanced by a Go controller. Weight synchronization between the two
 happens over a shared NCCL group, without going through veRL's rollout
 workers.
@@ -87,7 +87,7 @@ trainer and vLLM agree on one value.
 
 ### `RolloutControllerClient` (`client.py`)
 
-Thin HTTP client around the Go controller's REST API. Endpoints used:
+HTTP client around the Go controller's REST API. Endpoints used:
 
 | Method | Endpoint | Called from |
 |---|---|---|
@@ -115,7 +115,7 @@ Responsibilities:
 4. Pad all samples to `max_response_length`, build
    `prompts / responses / input_ids / attention_mask / position_ids /
    response_mask` tensors in the shape veRL's fit loop expects.
-5. **Launch reward computation as each generation completes** — see below.
+5. Launch reward computation as each generation completes — see below.
 6. Return a `DataProto` that the rest of the pipeline consumes unchanged.
 
 #### Streaming reward (reward launched during generation)
@@ -178,11 +178,11 @@ broadcast itself.
 
 Two broadcast modes (toggled by `cfg.use_packed`):
 
-- **Packed** (production): pack tensors into contiguous buffers up to
+- **Packed**: pack tensors into contiguous buffers up to
   `bucket_size` bytes, broadcast per bucket with `torch.cat`. Matches
   vLLM's `packed_broadcast_producer` algorithm exactly ("add then check"
   bucket boundary, variable bucket size).
-- **Non-packed** (debugging): one `pynccl.broadcast` per tensor.
+- **Non-packed**: one `pynccl.broadcast` per tensor.
 
 Both modes overlap CPU packing with GPU broadcasts via `BroadcastOperation`
 (runs NCCL in a background executor thread, matching veRL's native
@@ -222,14 +222,13 @@ actor_rollout_ref:
 ```
 
 Everything else (FSDP config, optimizer, PPO/GRPO hyperparams, reward
-model, dataset) stays exactly the same.
+model, dataset) stays exactly the same. In the given one-step-off policy example, all of this is already configured in the provided config maps.
 
 ---
 
 ## Logging
 
-All four modules use the `VERL_LOGGING_LEVEL` env var (same pattern as
-veRL core):
+All four modules use the `VERL_LOGGING_LEVEL` env var:
 
 ```python
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -257,32 +256,15 @@ merges into its `timing_raw` / wandb panel every step. The entries are:
 | Metric | Wall-clock window | What it captures | What it does NOT capture |
 |---|---|---|---|
 | `generate_sequences` | `t_start → t_end` (function entry → batch tensors assembled) | Prompt tokenization + all `POST /v1/generate` HTTPs + response parsing + padded-tensor build. Reward RPCs are **launched** inside this window but their Ray futures are not awaited yet. | The `ray.get` barrier on reward results. |
-| `llmd/http_generate` | `t_gen_start → t_gen_end` (threadpool submit → all generate responses collected) | Pure "how long did the fan-out of `POST /v1/generate` take" — dominated by vLLM decode time + controller overhead. | Tokenization, tensor build, reward. |
+| `llmd/http_generate` | `t_gen_start → t_gen_end` (threadpool submit → all generate responses collected) | Pure "how long did the fan-out of `POST /v1/generate` take" — dominated by vLLM decode time + controller overhead. | Tokenization, tensor build, reward. (Althougt there is a slight overlap, needs further invastigation) |
 | `llmd/reward_straggler_wait` | `t_end → ray.get completes` | Time spent **after** generation finished, waiting for the slowest reward Ray task to return. Named "straggler wait" on purpose. | **The true reward compute cost.** That cost was paid in parallel with generation and is effectively hidden inside `generate_sequences`. |
 
 ### Why `llmd/reward_straggler_wait` is not "reward time"
 
 Because reward RPCs are launched the moment each generation response
-arrives (see the [Streaming reward](#streaming-reward-reward-launched-during-generation)
-section), by the time generation as a whole is done, most — often all —
+arrives, by the time generation as a whole is done, most — often all —
 reward futures are already resolved. `ray.get` then returns quickly and
-`llmd/reward_straggler_wait ≈ 0`. It does **not** mean reward is free;
-it means reward finished overlapping with generation.
-
-Two cases:
-
-- Reward is faster than generation (typical for rule-based GSM8K,
-  millisecond-level scoring): every reward future is ready when gen
-  ends → `llmd/reward_straggler_wait ≈ 0`.
-- Reward is slower than generation (heavy GenRM, network pressure,
-  etc.): the barrier measures only the **excess** time, not the full
-  cost. So this metric always **lower-bounds** reward compute cost —
-  never upper-bounds it.
-
-If you want an honest reward-cost metric, instrument the reward worker
-itself and have it report per-sample latency, then summarize
-(max / p95 / sum) on the caller side. The current timers are kept
-honestly named so the wandb panel isn't misleading.
+`llmd/reward_straggler_wait ≈ 0`. If the reward ends up is slower than generation, the barrier measures only the **excess** time, not the full cost.
 
 ### Relationship to veRL's own timers
 
@@ -295,6 +277,49 @@ path is effectively free (just a `batch["rm_scores"]` lookup). Net
 result: when reading veRL wandb panels for this run, treat
 `generate_async` as "gen + reward" and `reward` as "≈ 0 by
 construction."
+
+---
+
+## Concurrency model
+
+`generate_sequences` is an `async` function (required by veRL's interface),
+but the actual concurrency comes from **threads**, not async I/O.
+
+```
+Main thread (asyncio event loop)       ← NOT blocked
+    │
+    └── await asyncio.to_thread(_collect_generate_results)
+              │
+              ▼
+         ThreadPoolExecutor (up to _MAX_CONCURRENT = 1024 workers)
+              │
+              ├── Thread 1: _generate_one() → sync HTTP POST → blocks
+              ├── Thread 2: _generate_one() → sync HTTP POST → blocks
+              │   ...
+              └── Thread N: _generate_one() → sync HTTP POST → blocks
+                                │
+                                └── on completion: _launch_reward()
+                                        └── ray.remote() ← returns immediately
+```
+
+### What "async-friendly" means
+
+The `asyncio.to_thread()` wrapper ensures the event loop isn't blocked while
+generation runs. If veRL had other async tasks (heartbeats, monitoring), they
+could run concurrently. The threads handle the actual HTTP I/O; the async
+wrapper just keeps the event loop responsive.
+
+### Reward concurrency
+
+Reward computation uses a different model: **Ray remote tasks**. When a
+generation response arrives, `_launch_reward()` calls
+`handle.compute_score.remote(...)`, which is non-blocking — it submits work
+to a Ray worker and returns an `ObjectRef` immediately. The actual reward
+computation runs on separate Ray actors (`reward_loop_worker`), fully
+parallel with HTTP threads still in flight.
+
+**Future consideration:** A true async refactor (using `aiohttp` +
+`asyncio.gather()`).
 
 ---
 
