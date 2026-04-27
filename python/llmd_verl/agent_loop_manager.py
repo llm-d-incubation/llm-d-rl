@@ -186,18 +186,7 @@ class _BatchGenerator:
             top_k=self.top_k,
             stop=self.stop_strings,
         )
-        try:
-            resp = self.client.generate(**kwargs)
-        except RuntimeError as exc:
-            # Gateway timeouts cause HTTP 502/503 errors.
-            # TODO: fix properly—distinguish timeouts in the client, tune gateway/client
-            # timeouts, and retry with backoff on explicit timeout responses instead
-            # of string-matching error text.
-            if "502" in str(exc) or "503" in str(exc):
-                logger.warning("[LLMD DEBUG] Generate request failed (%s), retrying once...", exc)
-                resp = self.client.generate(**kwargs)
-            else:
-                raise
+        resp = self.client.generate(**kwargs)
         return idx, resp
 
     def parse_response(self, resp: dict) -> tuple[list[int], list[float]]:
