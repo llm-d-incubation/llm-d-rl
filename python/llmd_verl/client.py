@@ -47,26 +47,40 @@ class RolloutControllerClient:
     def _post(self, path: str, body: dict | None = None) -> dict:
         url = self.base_url + path
         data = json.dumps(body or {}).encode()
-        req = Request(url, data=data, method="POST",
-                      headers={"Content-Type": "application/json"})
-        try:
-            with urlopen(req, timeout=self.timeout) as resp:
-                content = resp.read()
-                return json.loads(content) if content else {}
-        except HTTPError as exc:
-            body_text = exc.read().decode(errors="replace")
-            raise RuntimeError(f"POST {path} returned {exc.code}: {body_text}") from exc
+        last_exc: Exception = RuntimeError("no attempts made")
+        for attempt in range(1 + self.config.max_retries):
+            req = Request(url, data=data, method="POST",
+                          headers={"Content-Type": "application/json"})
+            try:
+                with urlopen(req, timeout=self.timeout) as resp:
+                    content = resp.read()
+                    return json.loads(content) if content else {}
+            except HTTPError as exc:
+                last_exc = exc
+            if attempt < self.config.max_retries:
+                logger.warning("POST %s failed (attempt %d/%d): %s — retrying in %.1fs",
+                               path, attempt + 1, 1 + self.config.max_retries,
+                               last_exc, self.config.retry_delay_s)
+                time.sleep(self.config.retry_delay_s)
+        raise last_exc
 
     def _get(self, path: str) -> dict:
         url = self.base_url + path
-        req = Request(url, method="GET")
-        try:
-            with urlopen(req, timeout=self.timeout) as resp:
-                content = resp.read()
-                return json.loads(content) if content else {}
-        except HTTPError as exc:
-            body_text = exc.read().decode(errors="replace")
-            raise RuntimeError(f"GET {path} returned {exc.code}: {body_text}") from exc
+        last_exc: Exception = RuntimeError("no attempts made")
+        for attempt in range(1 + self.config.max_retries):
+            req = Request(url, method="GET")
+            try:
+                with urlopen(req, timeout=self.timeout) as resp:
+                    content = resp.read()
+                    return json.loads(content) if content else {}
+            except HTTPError as exc:
+                last_exc = exc
+            if attempt < self.config.max_retries:
+                logger.warning("GET %s failed (attempt %d/%d): %s — retrying in %.1fs",
+                               path, attempt + 1, 1 + self.config.max_retries,
+                               last_exc, self.config.retry_delay_s)
+                time.sleep(self.config.retry_delay_s)
+        raise last_exc
 
     # --- Health & Status ---
 
