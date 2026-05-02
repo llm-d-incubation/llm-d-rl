@@ -60,5 +60,8 @@ spec:
       kind: InferencePool
       name: llm-d-pool
       port: 8000
+    # No timeout: LLM generation requests can take arbitrarily long depending on
+    # prompt length and max_tokens. The default 120s caused Envoy to terminate
+    # connections mid-generation ("upstream connect error / connection termination").
     timeouts:
-      request: 120s
+      request: 0s
