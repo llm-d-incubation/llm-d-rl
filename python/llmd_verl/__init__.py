@@ -7,7 +7,8 @@ Components:
     LlmdAgentLoopManager          — generation via HTTP to Go controller
     LlmdVerlCheckpointEngineManager — weight sync lifecycle (HTTP + Ray RPC)
     LlmdNcclCheckpointEngine      — NCCL broadcast on trainer GPU workers
-    RolloutControllerClient       — HTTP client for the Go controller
+    RolloutControllerClient       — sync HTTP client for the Go controller
+    AsyncRolloutControllerClient  — async HTTP client for the Go controller
 """
 
 __version__ = "0.1.0"

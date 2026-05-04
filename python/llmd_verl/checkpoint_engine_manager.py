@@ -32,14 +32,14 @@ Architecture
       rank 1+  (AllGather only, no broadcast)
 
 Weight sync flow each step:
-    1. _init_nccl_group_verl()   [once, lazy]
+    1. _init_nccl_group()   [once, lazy]
        - trainer.prepare()           → get rank-0 IP:port
        - trainer.init_process_group()→ rank 0 starts NCCL rendezvous
        - client.init_weight_transfer()→ vLLM pods join rendezvous
 
     2. update_weights(global_steps)  [every step]
        - trainer.update_weights()    → FSDP AllGather + NCCL send (non-blocking Ray RPC)
-       - client.update_weights()     → controller tells vLLM pods to recv (concurrent HTTP)
+       - await client.update_weights()→ controller tells vLLM pods to recv (async HTTP)
        - ray.get(trainer_refs)       → wait for broadcast to finish
 """
 
@@ -53,7 +53,7 @@ import time
 import ray
 from verl.utils.ray_utils import auto_await
 
-from .client import RolloutControllerClient
+from .client import AsyncRolloutControllerClient
 from .config import LlmdRolloutConfig
 
 logger = logging.getLogger(__name__)
@@ -86,7 +86,7 @@ class LlmdVerlCheckpointEngineManager:
 
     def __init__(self, config, trainer, replicas=None):
         self.llmd_config = _extract_llmd_config(config)
-        self.client = RolloutControllerClient(self.llmd_config)
+        self.client = AsyncRolloutControllerClient(self.llmd_config)
         self.trainer = trainer          # RayWorkerGroup
         # replicas intentionally ignored — llm-d controller owns vLLM pods
 
@@ -111,13 +111,13 @@ class LlmdVerlCheckpointEngineManager:
     @auto_await
     async def sleep_replicas(self) -> None:
         """Sleep all vLLM pods (free GPU memory while training runs)."""
-        await asyncio.to_thread(self.client.sleep, 2)
+        await self.client.sleep(2)
         logger.info("llm-d engines sleeping")
 
     @auto_await
     async def wake_up_replicas(self) -> None:
         """Resume all vLLM pods: recover KV cache and weights device memory."""
-        await asyncio.to_thread(self.client.wake_up, [])  # empty tags = wake all
+        await self.client.wake_up([])  # empty tags = wake all
         logger.info("llm-d engines awake")
 
     def add_replicas(self, replicas) -> None:
@@ -147,11 +147,10 @@ class LlmdVerlCheckpointEngineManager:
         # Other FSDP ranks participate in AllGather but skip the broadcast.
         trainer_refs = self.trainer.update_weights(global_steps=global_steps)
 
-        # Concurrent HTTP: tell Go controller to orchestrate each vLLM pod
+        # Async HTTP: tell Go controller to orchestrate each vLLM pod
         # (pause → participate in NCCL recv → resume).
         meta = self._param_metadata or {}
-        await asyncio.to_thread(
-            self.client.update_weights,
+        await self.client.update_weights(
             target_version=version,
             param_names=meta.get("param_names"),
             param_dtypes=meta.get("param_dtypes"),
@@ -194,7 +193,7 @@ class LlmdVerlCheckpointEngineManager:
 
         # 2. Query controller for how many vLLM pods exist
         # TODO: should update dynamically to support scale up and scale down?
-        status = await asyncio.to_thread(self.client.get_pool_status)
+        status = await self.client.get_pool_status()
         num_engines = status.get("total_engines", 0)
         if num_engines <= 0:
             raise RuntimeError(
@@ -232,8 +231,7 @@ class LlmdVerlCheckpointEngineManager:
             30.0,
         )
         logger.debug("TCPStore ready, calling controller init_weight_transfer")
-        await asyncio.to_thread(
-            self.client.init_weight_transfer,
+        await self.client.init_weight_transfer(
             master_address=master_meta["master_address"],
             master_port=master_meta["master_port"],
             world_size=world_size,
