@@ -72,6 +72,8 @@ data:
         gpu_memory_utilization: 0.85   # matches llmd vLLM pod setting (--gpu-memory-utilization 0.85)
         tensor_model_parallel_size: 1  # TP=1, 1 GPU per replica
         log_prob_micro_batch_size_per_gpu: 32  # micro batch for log prob computation during rollout
+        agent:
+          num_workers: 8
 
         checkpoint_engine:
           backend: "nccl"
@@ -151,6 +153,8 @@ data:
         checkpoint_manager_class: llmd_verl.checkpoint_engine_manager.LlmdVerlCheckpointEngineManager
         agent:
           agent_loop_manager_class: llmd_verl.agent_loop_manager.LlmdAgentLoopManager
+          default_agent_loop: llmd_single_turn
+          num_workers: 8
         custom:
           llmd:
             controller_url: ${oc.env:LLMD_CONTROLLER_URL,http://localhost:8090}

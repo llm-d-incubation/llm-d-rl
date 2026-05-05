@@ -4,7 +4,9 @@ This package provides veRL-compatible adapters that route training through
 llm-d-managed inference pods instead of veRL's Ray-managed vLLM processes.
 
 Components:
-    LlmdAgentLoopManager          — generation via HTTP to Go controller
+    LlmdAgentLoopManager          — spawns AgentLoopWorkers, splits batch, aggregates
+    LlmdAgentLoopWorker           — Ray actor injecting HTTP client as server_manager
+    LlmdSingleTurnAgentLoop       — agent loop calling llm-d HTTP API directly
     LlmdVerlCheckpointEngineManager — weight sync lifecycle (HTTP + Ray RPC)
     LlmdNcclCheckpointEngine      — NCCL broadcast on trainer GPU workers
     RolloutControllerClient       — sync HTTP client for the Go controller
