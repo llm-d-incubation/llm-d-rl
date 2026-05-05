@@ -1,0 +1,203 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: verl-cluster
+  namespace: llm-d-rl
+spec:
+  rayVersion: '2.47.1'
+
+  headGroupSpec:
+    rayStartParams:
+      num-cpus: "4"
+    template:
+      spec:
+        # For NCCL weight sync and low-latency rollout, it is best to run Ray (head +
+        # workers), the llm-d rollout controller, and vLLM engines on the same node(s).
+        # Uncomment affinity below to pin scheduling when you want that.
+        # affinity:
+        #   nodeAffinity:
+        #     requiredDuringSchedulingIgnoredDuringExecution:
+        #       nodeSelectorTerms:
+        #       - matchExpressions:
+        #         - key: kubernetes.io/hostname
+        #           operator: In
+        #           values:
+        #           - your-node-hostname
+        containers:
+        - name: ray-head
+          image: ghcr.io/naomieisen/verl:vllm-v17
+          imagePullPolicy: Always
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                - /bin/bash
+                - -c
+                - |
+                  exec > /tmp/setup_log.txt 2>&1
+                  echo "Starting setup..."
+
+                  # veRL and llmd_verl are already installed in the image.
+                  # Just prepare data and prefetch the model.
+                  mkdir -p /tmp/verl/hf_cache/datasets
+
+                  # Generate training data
+                  python3 /opt/verl/examples/data_preprocess/gsm8k.py --local_save_dir /tmp/verl/data/gsm8k
+
+                  # Pre-fetch model weights
+                  python3 -c "import transformers; transformers.pipeline('text-generation', model='Qwen/Qwen2.5-3B-Instruct')"
+
+                  echo "Setup complete" > /tmp/verl_ready.txt
+          env:
+          # --- llm-d integration ---
+          - name: LLMD_CONTROLLER_URL
+            value: "http://rollout-controller.llm-d-rl.svc.cluster.local:8090" # update namespace if needed <service>.<namespace>.svc.cluster.local
+
+          # --- veRL / llmd_verl log verbosity (DEBUG / INFO / WARN / ERROR) ---
+          - name: VERL_LOGGING_LEVEL
+            value: "DEBUG"
+
+          # --- veRL / Ray settings (keep from working config) ---
+          - name: TOKENIZERS_PARALLELISM
+            value: "false"
+          - name: OMP_NUM_THREADS
+            value: "1"
+          - name: VLLM_USE_V1
+            value: "1"
+          - name: RAY_CHEF_MAX_WORKERS
+            value: "1"
+          - name: VERL_NUM_THREADS
+            value: "1"
+          - name: RAY_NUM_CPUS_PER_PROCESSER
+            value: "1"
+          - name: HOME
+            value: "/tmp"
+          - name: FLASHINFER_WORKSPACE_DIR
+            value: "/tmp/flashinfer"
+          - name: HF_HOME
+            value: "/tmp/verl/hf_cache"
+          - name: HF_DATASETS_CACHE
+            value: "/tmp/verl/hf_cache/datasets"
+          - name: XDG_CACHE_HOME
+            value: "/tmp/verl/hf_cache"
+          - name: HUGGINGFACE_HUB_CACHE
+            value: "/tmp/verl/hf_cache"
+          - name: TRITON_CACHE_DIR
+            value: "/tmp/triton"
+          - name: PYTHONUSERBASE
+            value: "/tmp/.local"
+          resources:
+            limits:
+              cpu: "32"
+              memory: "96G"
+              # No GPU on head — it only runs the driver (fit() loop) and Ray GCS.
+              # FSDP training and NCCL broadcast happen on worker pods.
+            requests:
+              cpu: "24"
+              memory: "64G"
+          ports:
+          - containerPort: 6379
+            name: gcs-server
+          - containerPort: 8265
+            name: dashboard
+          - containerPort: 10001
+            name: client
+          volumeMounts:
+          - mountPath: /dev/shm
+            name: dshm
+          - mountPath: /etc/verl-configs
+            name: verl-configs
+            readOnly: true
+        volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: "32Gi"
+        - name: verl-configs
+          configMap:
+            name: verl-configs
+
+  workerGroupSpecs:
+  - groupName: fsdp-workers
+    replicas: 1
+    minReplicas: 1
+    maxReplicas: 4
+    rayStartParams:
+      num-cpus: "32"   # limit Ray's visible CPUs to reduce internal thread spawning
+    template:
+      spec:
+        # Same as head: prefer same-node placement for trainer NCCL ↔ vLLM.
+        # affinity:
+        #   nodeAffinity:
+        #     requiredDuringSchedulingIgnoredDuringExecution:
+        #       nodeSelectorTerms:
+        #       - matchExpressions:
+        #         - key: kubernetes.io/hostname
+        #           operator: In
+        #           values:
+        #           - your-node-hostname
+        containers:
+        - name: ray-worker
+          image: ghcr.io/naomieisen/verl:vllm-v17
+          imagePullPolicy: Always
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                - /bin/bash
+                - -c
+                - |
+                  exec > /tmp/setup_log.txt 2>&1
+                  mkdir -p /tmp/verl/hf_cache/datasets
+                  python3 /opt/verl/examples/data_preprocess/gsm8k.py --local_save_dir /tmp/verl/data/gsm8k
+                  echo "Setup complete" > /tmp/verl_ready.txt
+          env:
+          # --- llm-d integration ---
+          - name: LLMD_CONTROLLER_URL
+            value: "http://rollout-controller.naomi-llmd-rl.svc.cluster.local:8090"
+
+          # --- veRL / llmd_verl log verbosity (DEBUG / INFO / WARN / ERROR) ---
+          - name: VERL_LOGGING_LEVEL
+            value: "DEBUG"
+
+          # --- veRL / Ray settings ---
+          - name: PYTORCH_CUDA_ALLOC_CONF
+            # safe to use True — no vLLM running inside the Ray worker (rollout is in llm-d pods).
+            value: "expandable_segments:True"
+          - name: TOKENIZERS_PARALLELISM
+            value: "false"
+          - name: OMP_NUM_THREADS
+            value: "1"
+          - name: RAY_max_grpc_threads
+            value: "32"
+          - name: HOME
+            value: "/tmp"
+          - name: HF_HOME
+            value: "/tmp/verl/hf_cache"
+          - name: TRITON_CACHE_DIR
+            value: "/tmp/triton"
+          - name: PYTHONUSERBASE
+            value: "/tmp/.local"
+          resources:
+            limits:
+              cpu: "16"
+              memory: "64G"
+              nvidia.com/gpu: "2"   # 2 training GPUs (llmd owns rollout externally)
+            requests:
+              cpu: "8"
+              memory: "32G"
+              nvidia.com/gpu: "2"
+          volumeMounts:
+          - mountPath: /dev/shm
+            name: dshm
+          - mountPath: /etc/verl-configs
+            name: verl-configs
+            readOnly: true
+        volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: "64Gi"
+        - name: verl-configs
+          configMap:
+            name: verl-configs

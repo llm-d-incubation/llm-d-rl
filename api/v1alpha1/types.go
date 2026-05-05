@@ -96,6 +96,10 @@ type GenerateRequest struct {
 	// ReturnLogprobs requests per-token log probabilities in the response.
 	ReturnLogprobs bool `json:"return_logprobs,omitempty"`
 
+	// ReturnTokenIDs requests generated token IDs in the response when supported
+	// by the underlying engine endpoint.
+	ReturnTokenIDs bool `json:"return_token_ids,omitempty"`
+
 	// WeightVersion is the expected weight version. If set, the controller
 	// validates that engines are running this version before dispatching.
 	WeightVersion int64 `json:"weight_version,omitempty"`
@@ -175,6 +179,18 @@ type WeightUpdateRequest struct {
 
 	// ParamShapes lists the shape of each parameter as a list of ints.
 	ParamShapes [][]int `json:"param_shapes,omitempty"`
+
+	// Packed enables packed tensor broadcasting for efficient NCCL transfer.
+	// When true, multiple tensors are batched into buffers before broadcasting.
+	Packed bool `json:"packed,omitempty"`
+
+	// PackedBufferSizeBytes is the size of each packed buffer in bytes.
+	// Both trainer and vLLM must use the same value. Default is 1GB.
+	PackedBufferSizeBytes int64 `json:"packed_buffer_size_bytes,omitempty"`
+
+	// PackedNumBuffers is the number of buffers for double/triple buffering.
+	// Both trainer and vLLM must use the same value. Default is 2.
+	PackedNumBuffers int `json:"packed_num_buffers,omitempty"`
 }
 
 // PoolStatus reports the current state of the engine pool.

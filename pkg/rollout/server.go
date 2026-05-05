@@ -158,6 +158,9 @@ func (s *Server) buildOAIRequest(ctx context.Context, baseURL string, req *v1alp
 	if req.ReturnLogprobs {
 		oaiReq["logprobs"] = 1
 	}
+	if req.ReturnTokenIDs {
+		oaiReq["return_token_ids"] = true
+	}
 	return json.Marshal(oaiReq)
 }
 

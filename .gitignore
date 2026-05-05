@@ -10,3 +10,4 @@ vendor/
 __pycache__/
 *.pyc
 rollout-controller
+.DS_Store
