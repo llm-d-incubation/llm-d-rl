@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-d-rl-vime-integration"
+version = "0.1.0"
+description = "llm-d EPP + Envoy registration shim for vime"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "pyyaml",
+    "llm-d-rl-common @ git+https://github.com/llm-d-incubation/llm-d-rl.git#subdirectory=integrations/common",
+]
+
+[project.scripts]
+vime-router-shim = "llm_d_rl_vime_integration.router_shim:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["llm_d_rl_vime_integration*"]

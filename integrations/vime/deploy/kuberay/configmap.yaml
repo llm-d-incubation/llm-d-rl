@@ -1,0 +1,22 @@
+# ConfigMap generated from the standalone config files in deploy/.
+#
+# `bash deploy.sh apply` (or `deploy.sh configmap`) builds this from the
+# standalone files into the namespace set via NAMESPACE — do not run kubectl
+# by hand. The equivalent manual command is:
+#
+#   kubectl create configmap llmd-epp-configs-vime \
+#     --from-file=epp-config.yaml=deploy/epp-config.yaml \
+#     --from-file=envoy.yaml=deploy/envoy.yaml \
+#     --namespace "$NAMESPACE" \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#
+# The standalone files (epp-config.yaml, envoy.yaml) are the source of truth.
+# Edit those, then re-run deploy.sh to update the ConfigMap.
+# Do NOT edit the embedded content here directly.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llmd-epp-configs-vime
+  # namespace is set at creation time (deploy.sh --namespace "$NAMESPACE").
+# --- content managed via kubectl create configmap --from-file (see header) ---

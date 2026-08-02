@@ -1,0 +1,219 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: vime-cluster
+  namespace: ${NAMESPACE}
+spec:
+  rayVersion: '2.56.1'
+
+  # Single-pod layout: head owns all GPUs. Avoids the two-pod split where
+  # vLLM's import-time CUDA check fails on a CPU-only head.
+
+  headGroupSpec:
+    rayStartParams:
+      num-cpus: "16"
+      num-gpus: "4"
+    template:
+      spec:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              - matchExpressions:
+                # Exclude known-faulty nodes. Add hostnames as needed.
+                - key: kubernetes.io/hostname
+                  operator: NotIn
+                  values:
+                  - excluded-node
+                  - pokprod-b93r44s0
+                # Uncomment to pin to specific nodes (e.g. a GPU island).
+                # - key: kubernetes.io/hostname
+                #   operator: In
+                #   values:
+                #   - gpu-node-1
+                #   - gpu-node-2
+
+        initContainers:
+        - name: fetch-binaries
+          image: ${IMG_CRANE}
+          command: ["/busybox/sh", "-c"]
+          args:
+          - |
+            set -e
+            /ko-app/crane export --platform linux/amd64 "$EPP_IMAGE"   - | /busybox/tar -xOf - app/epp             > /opt/llm-d-bins/epp
+            /ko-app/crane export --platform linux/amd64 "$ENVOY_IMAGE" - | /busybox/tar -xOf - usr/local/bin/envoy > /opt/llm-d-bins/envoy
+            chmod +x /opt/llm-d-bins/epp /opt/llm-d-bins/envoy
+          env:
+          - name: EPP_IMAGE
+            value: "${IMG_EPP}"
+          - name: ENVOY_IMAGE
+            value: "${IMG_ENVOY}"
+          volumeMounts:
+          - mountPath: /opt/llm-d-bins
+            name: llm-d-bins
+
+        containers:
+        - name: ray-head
+          image: ${IMG_VIME}
+          imagePullPolicy: Always
+          workingDir: /tmp
+          livenessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 30
+            periodSeconds: 5
+            failureThreshold: 10
+          readinessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 5
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                - /bin/bash
+                - -c
+                - |
+                  exec > /tmp/setup_log.txt 2>&1
+                  set -euxo pipefail
+                  export PATH="/tmp/.local/bin:$PATH"
+                  echo "=== vime setup ==="
+
+                  git clone --depth=1 https://github.com/vllm-project/vime.git /tmp/vime
+                  pip install --no-deps -e /tmp/vime
+
+                  git clone --depth=1 -b core_v0.16.0 https://github.com/NVIDIA/Megatron-LM.git /tmp/Megatron-LM
+                  mkdir -p /tmp/pyfix
+                  printf 'import sys\nclass _S:\n def __init__(self,f):self._f=f\n def find_spec(self,*a,**k):\n  try:return self._f.find_spec(*a,**k)\n  except(PermissionError,OSError):return None\nsys.meta_path[:]=[_S(f) if "editable" in getattr(type(f),"__module__","") else f for f in sys.meta_path]\n' > /tmp/pyfix/sitecustomize.py
+
+                  # Install the common package first (vime integration depends on it), then the
+                  # integration package itself. Fail loudly: set -e aborts before the ready
+                  # marker if a clone/build fails, and the import checks turn a silent empty
+                  # install into a hard postStart error (container restarts) instead of a pod
+                  # that looks ready but is broken.
+                  pip install --no-deps --no-cache-dir --force-reinstall "git+https://github.com/llm-d-incubation/llm-d-rl.git#subdirectory=integrations/common"
+                  python3 -c "import llm_d_rl_common" || { echo "FATAL: common package not importable after install"; exit 1; }
+                  pip install --no-deps --no-cache-dir --force-reinstall "git+https://github.com/llm-d-incubation/llm-d-rl.git#subdirectory=integrations/vime"
+                  python3 -c "import llm_d_rl_vime_integration" || { echo "FATAL: vime integration package not importable after install"; exit 1; }
+
+                  # Pre-create empty endpoints file so EPP's file-discovery plugin
+                  # can watch it from the start (EPP crashes if the file is absent).
+                  printf 'endpoints: []\n' > /tmp/epp-endpoints.yaml
+
+                  nohup /opt/llm-d-bins/epp \
+                    --config-file /etc/llmd-configs/epp-config.yaml \
+                    --pool-name file-discovery \
+                    --pool-namespace default \
+                    --grpc-port 9002 \
+                    --grpc-health-port 9003 \
+                    --metrics-port 9090 \
+                    --secure-serving=false \
+                    --tracing=false \
+                    >> /tmp/epp.log 2>&1 &
+
+                  nohup /opt/llm-d-bins/envoy \
+                    -c /etc/llmd-configs/envoy.yaml \
+                    >> /tmp/envoy.log 2>&1 &
+
+                  nohup vime-router-shim \
+                    --host 127.0.0.1 --port 3001 \
+                    --endpoints-file /tmp/epp-endpoints.yaml \
+                    > /tmp/shim.log 2>&1 &
+
+                  # EPP/Envoy/shim are up. Model download and training are
+                  # handled by run-qwen3-4B.sh (run manually from the head pod).
+                  echo "Setup complete" > /tmp/vime_ready.txt
+
+          env:
+          - name: HOME
+            value: "/tmp"
+          - name: USER
+            value: "ray"
+          - name: PYTHONPATH
+            value: "/tmp/pyfix:/tmp/Megatron-LM"
+          - name: MY_POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: HF_HOME
+            value: "/tmp/vime/hf_cache"
+          - name: HF_DATASETS_CACHE
+            value: "/tmp/vime/hf_cache/datasets"
+          - name: XDG_CACHE_HOME
+            value: "/tmp/vime/hf_cache"
+          - name: HUGGINGFACE_HUB_CACHE
+            value: "/tmp/vime/hf_cache"
+          - name: TRITON_CACHE_DIR
+            value: "/tmp/triton"
+          - name: FLASHINFER_WORKSPACE_DIR
+            value: "/tmp/flashinfer"
+          - name: TORCHINDUCTOR_CACHE_DIR
+            value: "/tmp/torch_inductor_cache"
+          - name: VLLM_TARGET_DEVICE
+            value: "cuda"
+          - name: TOKENIZERS_PARALLELISM
+            value: "false"
+          - name: OMP_NUM_THREADS
+            value: "1"
+          - name: RAY_max_grpc_threads
+            value: "32"
+          - name: NCCL_DEBUG
+            value: "INFO"
+          - name: WANDB_MODE
+            value: "offline"
+          - name: VIME_EPP_BINARY
+            value: "/opt/llm-d-bins/epp"
+          - name: VIME_ENVOY_BINARY
+            value: "/opt/llm-d-bins/envoy"
+          - name: VIME_ROUTER_PORT
+            value: "8081"
+
+          resources:
+            limits:
+              cpu: "32"
+              memory: "256G"
+              nvidia.com/gpu: "4"
+            requests:
+              cpu: "16"
+              memory: "128G"
+              nvidia.com/gpu: "4"
+
+          ports:
+          - containerPort: 6379
+            name: gcs-server
+          - containerPort: 8265
+            name: dashboard
+          - containerPort: 10001
+            name: client
+          - containerPort: 8081
+            name: envoy
+
+          volumeMounts:
+          - mountPath: /opt/llm-d-bins
+            name: llm-d-bins
+          - mountPath: /dev/shm
+            name: dshm
+          - mountPath: /etc/llmd-configs
+            name: llmd-epp-configs-vime
+            readOnly: true
+          - mountPath: /.cache
+            name: vllm-cache
+          - mountPath: /.triton
+            name: triton-cache
+
+        volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: "64Gi"
+        - name: llmd-epp-configs-vime
+          configMap:
+            name: llmd-epp-configs-vime
+        - name: llm-d-bins
+          emptyDir: {}
+        - name: vllm-cache
+          emptyDir: {}
+        - name: triton-cache
+          emptyDir: {}

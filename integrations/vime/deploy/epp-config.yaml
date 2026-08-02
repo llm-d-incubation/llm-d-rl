@@ -1,0 +1,73 @@
+# EPP config for vime — burst prefix-cache routing (mirrors verl integration).
+#
+# Pipeline: vllmhttp-parser → burst-prefix-cache-producer → prefix-cache-scorer (2)
+#           + load-aware-scorer (1) → max-score-picker.
+#
+# The burst producer groups same-prompt rollout samples onto one replica so the
+# KV cache is warm for all G samples of a prompt (the RL group-scatter problem).
+# prefix-cache-scorer wins 2:1 over load-aware so co-location beats load balancing.
+#
+# If vime's /inference/v1/generate requests do not carry a token_ids field,
+# vllmhttp-parser will not extract routing tokens and EPP silently falls back
+# to load-aware scoring — no error, no regression vs the previous config.
+
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+
+plugins:
+  - name: file-discovery
+    type: file-discovery
+    parameters:
+      path: /tmp/epp-endpoints.yaml
+      watchFile: true
+
+  - name: prefix-cache-scorer
+    type: prefix-cache-scorer
+    parameters:
+      prefixMatchInfoProducerName: burst-prefix-cache-producer
+
+  - name: burst-prefix-cache-producer
+    type: burst-prefix-cache-producer
+    parameters:
+      windowDurationMs: 1000
+      maxPerReplica: -1
+      blockSizeTokens: 64
+      minColocateBlocks: 1
+      maxBatchSize: 10000
+      balanceBy: tokens
+
+  - name: load-aware-scorer
+    type: load-aware-scorer
+
+  - name: max-score-picker
+    type: max-score-picker
+
+  - name: metrics-source
+    type: metrics-data-source
+
+  - name: metrics-extractor
+    type: core-metrics-extractor
+
+  - name: vllmhttp-parser
+    type: vllmhttp-parser
+
+requestHandler:
+  parsers:
+    - pluginRef: vllmhttp-parser
+
+schedulingProfiles:
+  - name: default
+    plugins:
+      - pluginRef: prefix-cache-scorer
+        weight: 2
+      - pluginRef: load-aware-scorer
+        weight: 1
+      - pluginRef: max-score-picker
+
+dataLayer:
+  discovery:
+    pluginRef: file-discovery
+  sources:
+    - pluginRef: metrics-source
+      extractors:
+        - pluginRef: metrics-extractor
