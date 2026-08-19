@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
 # Submit a Qwen3-4B training job on the running vime KubeRay cluster.
-# Run this from inside the head pod after the cluster is ready.
+# scripts/run_on_head.sh copies this to the head as run_test.sh.
 #
 # Usage:
-#   bash /etc/llmd-configs/run-qwen3-4B.sh --native
-#       vime's built-in vLLM router, with --router-balance-abs-threshold 0
-#       so cache-aware routing does not pin the whole batch on one engine
-#   bash /etc/llmd-configs/run-qwen3-4B.sh --llmd
-#       llm-d EPP + Envoy routing (--vllm-router-ip/-port point vime at Envoy)
-#   bash /etc/llmd-configs/run-qwen3-4B.sh --native --steps 6
-#       short run (6 training steps); default: 500
+#   FRAMEWORK=vime scripts/run_on_head.sh --mode native
+#   FRAMEWORK=vime scripts/run_on_head.sh --mode llm-d --steps 6 --tp 2 --n 4
+#
+# --mode epp is not supported (use native or llm-d). --task is ignored with a warning.
 #
 # Both modes run the same engine layout - 4 engines at TP=1
 # (--rollout-num-gpus 4 --rollout-num-gpus-per-engine 1, set unconditionally
@@ -18,21 +15,41 @@ set -euo pipefail
 
 MODE=""
 STEPS=500
+TP=2
+N=4
 FORCE_DOWNLOAD=false
+TASK_SKIP="WARNING: --task is skipped; this driver always runs Qwen3-4B"
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --native)         MODE=native; shift ;;
-    --llmd)           MODE=llmd; shift ;;
+    --mode)           MODE="$2"; shift 2 ;;
+    --mode=*)         MODE="${1#--mode=}"; shift ;;
     --steps)          STEPS="$2"; shift 2 ;;
     --steps=*)        STEPS="${1#--steps=}"; shift ;;
+    --tp)             TP="$2"; shift 2 ;;
+    --tp=*)           TP="${1#--tp=}"; shift ;;
+    --n)              N="$2"; shift 2 ;;
+    --n=*)            N="${1#--n=}"; shift ;;
     --force-download) FORCE_DOWNLOAD=true; shift ;;
+    --task)
+      echo "$TASK_SKIP (got '$2')" >&2
+      shift 2 ;;
+    --task=*)
+      echo "$TASK_SKIP (got '${1#--task=}')" >&2
+      shift ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 if [ -z "$MODE" ]; then
-  echo "Usage: $0 --native | --llmd [--steps N] [--force-download]" >&2
+  echo "Usage: $0 --mode native|llm-d [--steps N] [--tp TP] [--n N] [--force-download]" >&2
   exit 1
 fi
+case "$MODE" in
+  epp|epp-*)
+    echo "ERROR: --mode $MODE is not supported for vime (use native or llm-d)" >&2
+    exit 2 ;;
+  native|llm-d) ;;
+  *) echo "Unknown --mode: $MODE (use native or llm-d)" >&2; exit 2 ;;
+esac
 
 MODEL_DIR="/tmp/vime/models/${MODEL_NAME:-Qwen3-4B}"
 MEGATRON_DIR="/tmp/vime/models/${MODEL_NAME:-Qwen3-4B}_megatron"
@@ -79,7 +96,7 @@ fi
 echo "=== Submitting training job (mode: $MODE, steps: $STEPS) ==="
 
 EXTRA_ARGS=()
-if [ "$MODE" = "llmd" ]; then
+if [ "$MODE" = "llm-d" ]; then
   EXTRA_ARGS=(
     --vllm-router-ip "${MY_POD_IP}"
     --vllm-router-port 8081
@@ -107,15 +124,15 @@ ray job submit \
     --apply-chat-template \
     --rm-type deepscaler \
     --actor-num-nodes 1 \
-    --actor-num-gpus-per-node 2 \
-    --tensor-model-parallel-size 2 \
+    --actor-num-gpus-per-node "$TP" \
+    --tensor-model-parallel-size "$TP" \
     --sequence-parallel \
     --recompute-activations \
     --rollout-num-gpus 4 \
     --rollout-num-gpus-per-engine 1 \
     --rollout-batch-size 32 \
     --num-rollout "$STEPS" \
-    --n-samples-per-prompt 4 \
+    --n-samples-per-prompt "$N" \
     --global-batch-size 128 \
     --rollout-max-response-len 8192 \
     --rollout-temperature 1 \

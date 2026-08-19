@@ -1,3 +1,0 @@
-# Extra files vime's run script needs on the pod, as key=path pairs relative to
-# quickstart/kuberay/. See ../verl/configmap-files.txt for the rationale.
-run-qwen3-4B.sh=../benchmarks/vime/run-qwen3-4B.sh

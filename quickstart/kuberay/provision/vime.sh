@@ -19,7 +19,7 @@ llmd_pep668
 export PATH="/tmp/.local/bin:$PATH"
 
 git clone --quiet --depth=1 -b "$VIME_REF" "$VIME_REPO" /tmp/vime 2>/dev/null || llmd_log "/tmp/vime already present"
-pip install --no-deps -e /tmp/vime >/dev/null
+pip install --no-deps --user /tmp/vime >/dev/null
 git clone --quiet --depth=1 -b "$MEGATRON_REF" https://github.com/NVIDIA/Megatron-LM.git /tmp/Megatron-LM 2>/dev/null || llmd_log "/tmp/Megatron-LM already present"
 
 # Editable-install finders raise PermissionError on some paths under Ray's
@@ -44,12 +44,12 @@ if [[ "$ROLE" == "head" ]]; then
   nohup llm-d-rl-router \
     --epp-config "$LLMD_CONFIG_DIR/epp-config.yaml" \
     --envoy-config "$LLMD_CONFIG_DIR/envoy.yaml" \
-    >> /tmp/router.log 2>&1 &
+    </dev/null >> /tmp/router.log 2>&1 &
   nohup llm-d-registration-shim \
     --engine-type vllm \
     --host 127.0.0.1 --port 3001 \
     --endpoints-file "$ENDPOINTS_FILE" \
-    > /tmp/shim.log 2>&1 &
+    </dev/null > /tmp/shim.log 2>&1 &
 fi
 
 llmd_write_marker vime "$VIME_REF" "$ENGINE_PY_MODULE" "$ROLE"

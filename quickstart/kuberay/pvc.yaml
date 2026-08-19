@@ -11,8 +11,9 @@
 # worker mount it at the same time.
 #
 # Not deleted by `deploy.sh delete` on purpose: the point is to outlive the
-# cluster. `kubectl delete pvc verl-cache -n $NAMESPACE` to reclaim it (the
-# shared-vast StorageClass is Retain, so the volume itself survives that too).
+# cluster. `kubectl delete pvc verl-cache -n $NAMESPACE` to reclaim it.
+# No storageClassName: the cluster default StorageClass is used. The default
+# must support ReadWriteMany (head and worker mount this at the same time).
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -21,11 +22,9 @@ metadata:
 spec:
   accessModes:
   - ReadWriteMany
-  # shared-vast is the cluster default (csi.vastdata.com, RWX, expansion
-  # allowed). 1Ti holds Qwen3-4B (~8G) + Qwen2.5-7B-Instruct-1M (~15G) + the
-  # parquet datasets + the HF cache with room to spare; expand rather than
-  # recreate if it fills.
-  storageClassName: shared-vast
+  # 1Ti holds Qwen3-4B (~8G) + Qwen2.5-7B-Instruct-1M (~15G) + the parquet
+  # datasets + the HF cache with room to spare; expand rather than recreate
+  # if it fills.
   resources:
     requests:
       storage: 1Ti

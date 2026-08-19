@@ -88,10 +88,25 @@ is what catches that.
 
 ## 4. Run something
 
+verl:
+
 ```bash
 cd ../benchmarks
 scripts/run_on_head.sh --mode epp --task gsm8k --steps 1
-FRAMEWORK=vime scripts/run_on_head.sh ...
+```
+
+vime:
+
+```bash
+cd ../benchmarks
+FRAMEWORK=vime scripts/run_on_head.sh --mode llm-d --steps 1
+```
+
+slime:
+
+```bash
+cd ../benchmarks
+FRAMEWORK=slime scripts/run_on_head.sh --mode llm-d --steps 1
 ```
 
 See [`../benchmarks/verl/README.md`](../benchmarks/verl/README.md) for the

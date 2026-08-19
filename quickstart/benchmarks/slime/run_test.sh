@@ -1,30 +1,45 @@
 #!/usr/bin/env bash
 # Submit a Qwen3-4B GRPO training job on the running slime KubeRay cluster.
-# Run this from inside the head pod after the cluster is ready.
+# scripts/run_on_head.sh copies this to the head as run_test.sh.
 #
 # Usage:
-#   bash run-qwen3-4B.sh                       EPP + Envoy routing (llm-d), default
-#   bash run-qwen3-4B.sh --mode llm-d          same
-#   bash run-qwen3-4B.sh --mode native         slime's built-in sglang-router, no EPP
-#   bash run-qwen3-4B.sh --steps 6             short run (6 training steps); default: 500
-#   bash run-qwen3-4B.sh --force-download      re-download model/data even if present
+#   FRAMEWORK=slime scripts/run_on_head.sh --mode llm-d
+#   FRAMEWORK=slime scripts/run_on_head.sh --mode native --steps 6 --tp 2 --n 4
+#
+# --mode epp is not supported (use native or llm-d). --task is ignored with a warning.
 set -euo pipefail
 
 MODE=llm-d
 STEPS=500
+TP=2
+N=4
 FORCE_DOWNLOAD=false
+TASK_SKIP="WARNING: --task is skipped; this driver always runs Qwen3-4B"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode) MODE="$2"; shift 2 ;;
     --mode=*) MODE="${1#--mode=}"; shift ;;
     --steps) STEPS="$2"; shift 2 ;;
     --steps=*) STEPS="${1#--steps=}"; shift ;;
+    --tp) TP="$2"; shift 2 ;;
+    --tp=*) TP="${1#--tp=}"; shift ;;
+    --n) N="$2"; shift 2 ;;
+    --n=*) N="${1#--n=}"; shift ;;
     --force-download) FORCE_DOWNLOAD=true; shift ;;
+    --task)
+      echo "$TASK_SKIP (got '$2')" >&2
+      shift 2 ;;
+    --task=*)
+      echo "$TASK_SKIP (got '${1#--task=}')" >&2
+      shift ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
 case "$MODE" in
+  epp|epp-*)
+    echo "ERROR: --mode $MODE is not supported for slime (use native or llm-d)" >&2
+    exit 2 ;;
   llm-d|native) ;;
   *) echo "Unknown --mode: $MODE (use llm-d or native)" >&2; exit 2 ;;
 esac
@@ -97,7 +112,7 @@ ray job submit \
   -- python3 /tmp/slime-src/train.py \
     "${ROUTER_ARGS[@]}" \
     --actor-num-nodes 1 \
-    --actor-num-gpus-per-node 2 \
+    --actor-num-gpus-per-node "$TP" \
     --rollout-num-gpus 4 \
     --rollout-num-gpus-per-engine 1 \
     "${MODEL_ARGS[@]}" \
@@ -109,7 +124,7 @@ ray job submit \
     --apply-chat-template \
     --num-rollout "$STEPS" \
     --rollout-batch-size 32 \
-    --n-samples-per-prompt 4 \
+    --n-samples-per-prompt "$N" \
     --rollout-max-response-len 8192 \
     --rollout-temperature 1 \
     --global-batch-size 128 \
@@ -128,7 +143,7 @@ ray job submit \
     --weight-decay 0.1 \
     --adam-beta1 0.9 \
     --adam-beta2 0.98 \
-    --tensor-model-parallel-size 2 \
+    --tensor-model-parallel-size "$TP" \
     --sequence-parallel \
     --recompute-granularity full \
     --recompute-method uniform \

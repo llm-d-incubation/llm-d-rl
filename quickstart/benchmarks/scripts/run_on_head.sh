@@ -9,9 +9,11 @@
 # Usage:
 #   scripts/run_on_head.sh --mode epp                 # background on pod + tail the log
 #   scripts/run_on_head.sh --mode epp --steps 20 --tp 2
-#   scripts/run_on_head.sh --fg --mode native         # run attached (foreground)
+#   scripts/run_on_head.sh --fg --mode native
+#   FRAMEWORK=vime scripts/run_on_head.sh --mode native --steps 1
+#   FRAMEWORK=slime scripts/run_on_head.sh --mode llm-d --tp 2 --n 4
 #
-# Modes / options are run_test.sh's: --mode native|epp, --steps, --tp, --n, --name, --reqlog.
+# Modes / options are the framework's run_test.sh: verl --mode native|epp; vime/slime --mode native|llm-d.
 #
 # Execution model:
 #   default  - nohup run_test.sh on the head into /tmp/train.log, then tail -f it.
@@ -116,13 +118,13 @@ fi
 
 if [ "$FG" -eq 1 ]; then
   echo "==> running attached (foreground): run_test.sh ${PASS[*]}"
-  exec kubectl exec -it -n "$NS" "$HEAD" -- env "${ENVV[@]}" bash /tmp/run_test.sh "${PASS[@]}"
+  exec kubectl exec -it -n "$NS" "$HEAD" -- env ${ENVV[@]+"${ENVV[@]}"} bash /tmp/run_test.sh "${PASS[@]}"
 fi
 
 echo "==> launching in background on the pod: run_test.sh ${PASS[*]}"
 kubectl exec -n "$NS" "$HEAD" -- bash -c \
   'nohup env "$@" > "'"$REMOTE_LOG"'" 2>&1 & echo "launched pid $!"' \
-  _ "${ENVV[@]}" bash /tmp/run_test.sh "${PASS[@]}"
+  _ ${ENVV[@]+"${ENVV[@]}"} bash /tmp/run_test.sh "${PASS[@]}"
 
 cat <<EOF
 ==> streaming $REMOTE_LOG (Ctrl-C detaches the tail; the run keeps going on the pod)

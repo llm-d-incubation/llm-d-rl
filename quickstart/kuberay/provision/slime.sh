@@ -44,12 +44,12 @@ if [[ "$ROLE" == "head" ]]; then
   nohup llm-d-rl-router \
     --epp-config "$LLMD_CONFIG_DIR/epp-config.yaml" \
     --envoy-config "$LLMD_CONFIG_DIR/envoy.yaml" \
-    >> /tmp/router.log 2>&1 &
+    </dev/null >> /tmp/router.log 2>&1 &
   nohup llm-d-registration-shim \
     --engine-type sglang --id-field id \
     --host 127.0.0.1 --port 3001 \
     --endpoints-file "$ENDPOINTS_FILE" \
-    > /tmp/shim.log 2>&1 &
+    </dev/null > /tmp/shim.log 2>&1 &
 fi
 
 llmd_write_marker slime "$SLIME_REF" "$ENGINE_PY_MODULE" "$ROLE"

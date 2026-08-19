@@ -199,7 +199,8 @@ pods_of_role() {
 exec_retry() {
   local pod="$1"; shift
   local n=0
-  until K exec -n "$NAMESPACE" -i -c "$(container_for "$pod")" "$pod" -- "$@"; do
+  local to="${KUBECTL_PROVISION_TIMEOUT:-900}"
+  until timeout "$to" kubectl exec -n "$NAMESPACE" -c "$(container_for "$pod")" "$pod" -- "$@" </dev/null; do
     n=$((n+1)); [[ $n -ge 3 ]] && { echo "ERROR: exec failed 3x on $pod" >&2; return 1; }
     echo "  retrying on $pod ($n/3)" >&2; sleep 5
   done
