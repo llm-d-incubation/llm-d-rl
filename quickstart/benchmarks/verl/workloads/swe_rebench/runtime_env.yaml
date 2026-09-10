@@ -1,0 +1,10 @@
+working_dir: ./
+excludes: ["/.git/"]
+env_vars:
+  TORCH_NCCL_AVOID_RECORD_STREAMS: "1"
+  CUDA_DEVICE_MAX_CONNECTIONS: "1"
+  VLLM_DISABLE_COMPILE_CACHE: "1"
+  # This cluster's flashinfer/flashinfer-cubin versions are mismatched
+  # (0.6.15.post1 vs 0.6.12); llm_d_rl_verl_integration imports flashinfer
+  # transitively via megatron-core, which raises on the mismatch otherwise.
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"

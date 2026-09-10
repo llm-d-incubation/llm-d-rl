@@ -1,0 +1,48 @@
+# uni-agent task config for the swe_rebench workload: provider: docker (no sandbox
+# credentials needed -- runs against the local Docker daemon on the node) and a token
+# budget/timeout. See train_swe_rebench.sh / README.md in this folder.
+- name: swe_bench
+  sandbox:
+    provider: docker
+    runtime_timeout: 3600
+  agent:
+    name: react
+    max_steps: 60
+    tools:
+      - name: stateful_shell
+        command_timeout: 120
+        env_vars:
+          PAGER: "cat"
+          GIT_PAGER: "cat"
+          MANPAGER: "cat"
+          TQDM_DISABLE: "1"
+          PIP_PROGRESS_BAR: "off"
+      - name: str_replace_editor
+      - name: submit
+    model:
+      temperature: 1.0
+      top_p: 1.0
+      max_total_tokens: 24576
+
+- name: swe_rebench
+  sandbox:
+    provider: docker
+    runtime_timeout: 3600
+  agent:
+    name: react
+    max_steps: 60
+    tools:
+      - name: stateful_shell
+        command_timeout: 120
+        env_vars:
+          PAGER: "cat"
+          GIT_PAGER: "cat"
+          MANPAGER: "cat"
+          TQDM_DISABLE: "1"
+          PIP_PROGRESS_BAR: "off"
+      - name: str_replace_editor
+      - name: submit
+    model:
+      temperature: 1.0
+      top_p: 1.0
+      max_total_tokens: 24576

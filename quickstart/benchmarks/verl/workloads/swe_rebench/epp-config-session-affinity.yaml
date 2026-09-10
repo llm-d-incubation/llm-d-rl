@@ -1,0 +1,70 @@
+# Session-affinity + active-request-load EPP config for verl.
+# Pipeline: file-discovery (verl endpoints) -> session-affinity-scorer (2) +
+# active-request-scorer (1) -> max-score-picker.
+#
+# session-affinity-scorer uses the session_id strategy, keyed off the
+# x-request-id header. uni_agent's EPPLLMClient (llm_d_rl_verl_integration)
+# sends request_id as an x-request-id header on every generation call, and
+# request_id == the episode's session_id (session-sample-<i>-rollout-<j>-<uuid>,
+# see uni_agent/framework/framework.py) -- stable across all turns of one
+# episode. So this pins every turn of an episode to the same replica, i.e.
+# genuine per-episode session affinity.
+#
+# active-request-scorer scores by live in-flight request count (distinct from
+# load-aware-scorer, which scores by queue depth) -- the secondary signal that
+# breaks ties / reroutes when a pinned replica is busy or a session needs
+# initial placement.
+
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+
+plugins:
+  - name: file-discovery
+    type: file-discovery
+    parameters:
+      path: /tmp/epp-endpoints.yaml
+      watchFile: true
+
+  - name: session-affinity-scorer
+    type: session-affinity-scorer
+    parameters:
+      strategy: session_id
+      sessionIdConfig:
+        sources:
+          - header: x-request-id
+
+  - name: active-request-scorer
+    type: active-request-scorer
+
+  - name: max-score-picker
+    type: max-score-picker
+
+  - name: metrics-source
+    type: metrics-data-source
+
+  - name: metrics-extractor
+    type: core-metrics-extractor
+
+  - name: vllmhttp-parser
+    type: vllmhttp-parser
+
+requestHandler:
+  parsers:
+    - pluginRef: vllmhttp-parser
+
+schedulingProfiles:
+  - name: default
+    plugins:
+      - pluginRef: session-affinity-scorer
+        weight: 2
+      - pluginRef: active-request-scorer
+        weight: 1
+      - pluginRef: max-score-picker
+
+dataLayer:
+  discovery:
+    pluginRef: file-discovery
+  sources:
+    - pluginRef: metrics-source
+      extractors:
+        - pluginRef: metrics-extractor
