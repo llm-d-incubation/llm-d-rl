@@ -215,6 +215,7 @@ provision() {
   local env_args=(FRAMEWORK="$FRAMEWORK" ENGINE_PY_MODULE="$ENGINE_PY_MODULE")
   local v
   for v in VERL_COMMIT VIME_REPO VIME_REF SLIME_REPO SLIME_REF MEGATRON_REF \
+           SKYRL_REPO SKYRL_REF \
            LLMD_REPO LLMD_REPO_REF LLMD_LOCAL_SRC "ENGINE_${ENGINE}_MIN_VERSION"; do
     [[ -n "${!v:-}" ]] && env_args+=("$v=${!v}")
   done
