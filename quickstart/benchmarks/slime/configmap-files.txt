@@ -1,3 +1,7 @@
 # Extra files slime's run script needs on the pod, as key=path pairs relative to
 # quickstart/kuberay/. See ../verl/configmap-files.txt for the rationale.
 run-qwen3-4B.sh=../benchmarks/slime/run-qwen3-4B.sh
+run_coding_agent_kuberay.sh=../benchmarks/slime/swe_agent/run_coding_agent_kuberay.sh
+benchmark.env=../benchmarks/slime/swe_agent/benchmark.env
+dind_sandbox.py=../benchmarks/slime/swe_agent/dind/dind_sandbox.py
+dind_generate.py=../benchmarks/slime/swe_agent/dind/dind_generate.py

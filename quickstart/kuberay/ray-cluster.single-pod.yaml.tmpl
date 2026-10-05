@@ -19,7 +19,7 @@ spec:
   headGroupSpec:
     rayStartParams:
       num-cpus: "16"
-      num-gpus: "6"
+      num-gpus: "${HEAD_GPUS}"
     template:
       spec:
         # EPP, Envoy and the KV sidecar are in none of the framework images. One
@@ -129,11 +129,11 @@ spec:
             limits:
               cpu: "32"
               memory: "256G"
-              nvidia.com/gpu: "6"
+              nvidia.com/gpu: "${HEAD_GPUS}"
             requests:
               cpu: "16"
               memory: "128G"
-              nvidia.com/gpu: "6"
+              nvidia.com/gpu: "${HEAD_GPUS}"
 
           ports:
           - containerPort: 6379
@@ -144,6 +144,8 @@ spec:
             name: client
           - containerPort: 8081
             name: envoy
+          - containerPort: 18001
+            name: anthropic-adpt
 
           volumeMounts:
           - mountPath: /opt/llm-d-bins
@@ -157,6 +159,18 @@ spec:
             name: engine-cache
           - mountPath: /.triton
             name: triton-cache
+          - mountPath: ${FW_HOME}/models
+            name: ${PVC_NAME}
+            subPath: models
+          - mountPath: ${FW_HOME}/data
+            name: ${PVC_NAME}
+            subPath: data
+          - mountPath: ${FW_HOME}/hf_cache
+            name: ${PVC_NAME}
+            subPath: hf_cache
+          - mountPath: ${FW_HOME}/tools
+            name: ${PVC_NAME}
+            subPath: tools
 
         volumes:
         - name: dshm
@@ -172,3 +186,6 @@ spec:
           emptyDir: {}
         - name: triton-cache
           emptyDir: {}
+        - name: ${PVC_NAME}
+          persistentVolumeClaim:
+            claimName: ${PVC_NAME}

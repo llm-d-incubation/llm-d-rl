@@ -13,7 +13,7 @@ worked example we run on our own cluster.
 | `frameworks.env` | per-framework cluster shape: topology, sizes, names |
 | `deploy.env` | values that belong to *this* cluster |
 | `ray-cluster.head-workers.yaml.tmpl` | CPU head + GPU worker group (verl) |
-| `ray-cluster.single-pod.yaml.tmpl` | one pod, GPUs on the head (vime, slime) |
+| `ray-cluster.single-pod.yaml.tmpl` | one pod, GPUs on the head (vime, slime, slime-swe-agent) |
 | `provision/<framework>.sh` | how each framework is installed on a node |
 | `pvc.yaml` | durable cache for checkpoints and datasets |
 | `setting-kuberay.md` | installing the KubeRay operator itself |
@@ -46,6 +46,7 @@ export NAMESPACE=<your-namespace>
 ./deploy.sh apply --framework verl --engine sglang
 ./deploy.sh apply --framework vime
 ./deploy.sh apply --framework slime
+./deploy.sh apply --framework slime-swe-agent
 ./deploy.sh render --framework verl                 # inspect first, no kubectl
 ```
 
@@ -96,6 +97,9 @@ FRAMEWORK=vime scripts/run_on_head.sh ...
 
 See [`../benchmarks/verl/README.md`](../benchmarks/verl/README.md) for the
 workloads and modes, and `llm-d-rl-verl-overrides --list` for what each mode sets.
+For coding-agent RL, see
+[`../benchmarks/slime/swe_agent/README.md`](../benchmarks/slime/swe_agent/README.md)
+(`--framework slime-swe-agent`).
 
 ## Changing versions
 
@@ -138,5 +142,12 @@ Provisioning also starts EPP, Envoy and the registration shim, because vime has
 no in-process hook to start them from.
 
 **slime** - single pod like vime. It needs an EPP image carrying
-`sglanghttp-parser`; `integrations/slime/environments.env` ships a placeholder and
-`deploy.sh` refuses to apply until you replace it.
+`sglanghttp-parser`; that override lives in `integrations/slime/environments.env`.
+- **slime-swe-agent** — same Ray image and slime git refs as slime
+  (`integrations/slime/environments.env`). `--framework slime-swe-agent` only
+  changes cluster extras: `deploy.sh pvc` makes **two** PVCs (`slime-cache` for
+  checkpoints/dataset, `sandbox-images` for DinD tarballs), and `provision`
+  adds sandbox tools (httpx, Node, Claude Code, swebench). Sandbox-runner pods
+  are **not** created by `deploy.sh`; they follow the Ray head via pod affinity.
+  Deploy them with `setup_sandbox.sh` in
+  [`../benchmarks/slime/swe_agent/`](../benchmarks/slime/swe_agent/README.md).

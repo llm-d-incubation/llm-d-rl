@@ -1,0 +1,395 @@
+# Sandbox runner: isolated pod that manages Docker containers.
+# The Ray head pod sends HTTP requests here.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sandbox-runner
+  namespace: ${NAMESPACE}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sandbox-runner-api
+  namespace: ${NAMESPACE}
+data:
+  server.py: |
+    #!/usr/bin/env python3
+    from __future__ import annotations
+    import asyncio, glob, os, re, tempfile, uuid
+    from fastapi import FastAPI, HTTPException, Request
+    from pydantic import BaseModel
+
+    app = FastAPI()
+
+    _IMAGE_CACHE_DIR = os.environ.get("IMAGE_CACHE_DIR", "/image-cache")
+
+    def _image_to_filename(image: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9._-]", "_", image) + ".tar"
+
+    # Each sandbox gets a slice of the dind cgroup budget.
+    _SANDBOX_CPUS   = os.environ.get("SANDBOX_CPUS", "2")
+    _SANDBOX_MEMORY = os.environ.get("SANDBOX_MEMORY", "3g")
+    _SANDBOX_PIDS   = os.environ.get("SANDBOX_PIDS", "512")
+
+    class CreateReq(BaseModel):
+        image: str
+        timeout: int = 3600
+
+    class ExecReq(BaseModel):
+        cmd: str
+        user: str | None = None
+        envs: dict = {}
+        timeout: float = 600
+
+    class PrefetchReq(BaseModel):
+        images: list[str]
+
+    @app.get("/health")
+    async def health():
+        p = await asyncio.create_subprocess_exec(
+            "docker", "version",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        if await p.wait() != 0:
+            raise HTTPException(503, detail="docker not ready")
+        return {"ok": True}
+
+    @app.post("/sandboxes")
+    async def create(req: CreateReq):
+        name = f"slime-sb-{uuid.uuid4().hex[:12]}"
+        # --entrypoint "" overrides any ENTRYPOINT in the image (SWE images ship
+        # ENTRYPOINT ["/bin/bash"] which would turn "sleep N" into "bash sleep N").
+        p = await asyncio.create_subprocess_exec(
+            "docker", "run", "--rm", "-d", "--name", name,
+            "--entrypoint", "", "--pull", "missing",
+            "--memory", _SANDBOX_MEMORY, "--cpus", _SANDBOX_CPUS,
+            "--pids-limit", _SANDBOX_PIDS,
+            req.image, "sleep", str(req.timeout),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, err = await p.communicate()
+        if p.returncode != 0:
+            raise HTTPException(500, detail=err.decode()[:400])
+        return {"id": out.decode().strip()}
+
+    @app.post("/sandboxes/{cid}/exec")
+    async def exec_cmd(cid: str, req: ExecReq):
+        args = ["docker", "exec"]
+        if req.user is not None:
+            args += ["--user", req.user]
+        for k, v in req.envs.items():
+            args += ["--env", f"{k}={v}"]
+        args += [cid, "sh", "-c", req.cmd]
+        p = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            o, e = await asyncio.wait_for(p.communicate(), timeout=req.timeout)
+        except asyncio.TimeoutError:
+            try: p.kill()
+            except ProcessLookupError: pass
+            await p.communicate()
+            raise HTTPException(408, detail="command timed out")
+        return {"exit_code": p.returncode,
+                "stdout": o.decode(errors="replace"),
+                "stderr": e.decode(errors="replace")}
+
+    @app.post("/sandboxes/{cid}/files/write")
+    async def write_file(cid: str, path: str, request: Request):
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            async for chunk in request.stream():
+                f.write(chunk)
+            tmp = f.name
+        os.chmod(tmp, 0o644)
+        try:
+            # create the directory if it doesn't exist, docker cp will not create missing parents
+            p = await asyncio.create_subprocess_exec(
+                "docker", "exec", cid, "mkdir", "-p",
+                os.path.dirname(path) or "/",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            await p.wait()
+            # Must not fail silently: the grader would score a patch that never arrived.
+            p = await asyncio.create_subprocess_exec(
+                "docker", "cp", tmp, f"{cid}:{path}",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+            _, err = await p.communicate()
+            if p.returncode != 0:
+                raise HTTPException(
+                    500, detail=f"write {path}: {err.decode(errors='replace')[:400]}")
+        finally:
+            try: os.unlink(tmp)
+            except OSError: pass
+        return {"ok": True}
+
+    @app.get("/sandboxes/{cid}/files/read")
+    async def read_file(cid: str, path: str):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".out") as f:
+            tmp = f.name
+        try:
+            p = await asyncio.create_subprocess_exec(
+                "docker", "cp", f"{cid}:{path}", tmp,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            if await p.wait() != 0:
+                return {"content": ""}
+            with open(tmp, "rb") as f:
+                return {"content": f.read().decode(errors="replace")}
+        finally:
+            try: os.unlink(tmp)
+            except OSError: pass
+
+    @app.delete("/sandboxes/{cid}")
+    async def kill_sandbox(cid: str):
+        p = await asyncio.create_subprocess_exec(
+            "docker", "rm", "-f", cid,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        await p.wait()
+        return {"ok": True}
+
+    @app.post("/images/load")
+    async def images_load():
+        """Load all cached tarballs from the PVC into DinD. Call once at pod startup."""
+        os.makedirs(_IMAGE_CACHE_DIR, exist_ok=True)
+        loaded = []
+        for tar_path in sorted(glob.glob(f"{_IMAGE_CACHE_DIR}/*.tar")):
+            p = await asyncio.create_subprocess_exec(
+                "docker", "load", "-i", tar_path,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            out, err = await p.communicate()
+            loaded.append({
+                "tar": os.path.basename(tar_path),
+                "rc": p.returncode,
+                "out": out.decode(errors="replace")[:200],
+            })
+        return {"loaded": loaded}
+
+    @app.post("/images/prefetch")
+    async def images_prefetch(req: PrefetchReq):
+        """Ensure each image is in DinD. Loads from PVC tar if available, else pulls."""
+        os.makedirs(_IMAGE_CACHE_DIR, exist_ok=True)
+        results = []
+        for image in req.images:
+            # Skip if already in DinD (loaded from PVC or pulled earlier this session)
+            chk = await asyncio.create_subprocess_exec(
+                "docker", "image", "inspect", image,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            if await chk.wait() == 0:
+                results.append({"image": image, "status": "cached"})
+                continue
+            tar_path = os.path.join(_IMAGE_CACHE_DIR, _image_to_filename(image))
+            # Load from PVC tar if available (avoids registry pull)
+            if os.path.exists(tar_path):
+                p = await asyncio.create_subprocess_exec(
+                    "docker", "load", "-i", tar_path,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                out, err = await p.communicate()
+                if p.returncode == 0:
+                    results.append({"image": image, "status": "loaded_from_tar"})
+                    continue
+            # Pull from registry (30-minute timeout per image)
+            try:
+                p = await asyncio.create_subprocess_exec(
+                    "docker", "pull", image,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                out, err = await asyncio.wait_for(p.communicate(), timeout=1800)
+            except asyncio.TimeoutError:
+                try: p.kill()
+                except ProcessLookupError: pass
+                await p.communicate()
+                results.append({"image": image, "status": "pull_timeout"})
+                continue
+            if p.returncode != 0:
+                results.append({"image": image, "status": "pull_failed",
+                                 "err": err.decode(errors="replace")[:400]})
+                continue
+            # Save to PVC so future pod restarts skip the pull
+            p = await asyncio.create_subprocess_exec(
+                "docker", "save", "-o", tar_path, image,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            out, err = await p.communicate()
+            if p.returncode != 0:
+                results.append({"image": image, "status": "save_failed",
+                                 "err": err.decode(errors="replace")[:200]})
+                continue
+            results.append({"image": image, "status": "pulled"})
+        pulled = sum(1 for r in results if r["status"] == "pulled")
+        cached = sum(1 for r in results if r["status"] == "cached")
+        loaded = sum(1 for r in results if r["status"] == "loaded_from_tar")
+        failed = sum(1 for r in results if r["status"] not in ("pulled", "cached", "loaded_from_tar"))
+        return {"results": results, "summary": {
+            "pulled": pulled, "cached": cached, "loaded_from_tar": loaded,
+            "failed": failed}}
+
+    # ── Adapter TCP relay ────────────────────────────────────────────────────
+    # DinD containers sit on the Docker bridge (172.17.0.0/16) and cannot
+    # reach cluster-internal IPs through OVN-Kubernetes NAT. We relay traffic
+    # on port 18001 (the adapter port) so DinD containers connect here and the
+    # relay forwards to the real adapter on the Ray head pod via cluster DNS.
+    _RELAY_HOST = os.environ.get("ADAPTER_RELAY_HOST", "")
+    _RELAY_PORT = int(os.environ.get("ADAPTER_RELAY_PORT", "18001"))
+
+    async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            while True:
+                data = await reader.read(65536)
+                if not data:
+                    break
+                writer.write(data)
+                await writer.drain()
+        except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    async def _relay_handler(client_r: asyncio.StreamReader, client_w: asyncio.StreamWriter) -> None:
+        peer = client_w.get_extra_info("peername")
+        print(f"[relay] accept {peer} -> {_RELAY_HOST}:{_RELAY_PORT}", flush=True)
+        try:
+            up_r, up_w = await asyncio.open_connection(_RELAY_HOST, _RELAY_PORT)
+            print(f"[relay] upstream ok {peer}", flush=True)
+            await asyncio.gather(_pipe(client_r, up_w), _pipe(up_r, client_w))
+        except Exception as exc:
+            print(f"[relay] FAILED {peer}: {type(exc).__name__}: {exc}", flush=True)
+        finally:
+            try:
+                client_w.close()
+            except Exception:
+                pass
+
+    if __name__ == "__main__":
+        import uvicorn
+
+        async def _main() -> None:
+            config = uvicorn.Config(app, host="0.0.0.0", port=8080, log_level="info")
+            server = uvicorn.Server(config)
+            tasks = [asyncio.create_task(server.serve())]
+            if _RELAY_HOST:
+                relay_srv = await asyncio.start_server(
+                    _relay_handler, "0.0.0.0", _RELAY_PORT
+                )
+                tasks.append(asyncio.create_task(relay_srv.serve_forever()))
+            await asyncio.gather(*tasks)
+
+        asyncio.run(_main())
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandbox-runner-${RUNNER_INDEX}
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sandbox-runner-${RUNNER_INDEX}
+  template:
+    metadata:
+      labels:
+        app: sandbox-runner-${RUNNER_INDEX}
+    spec:
+      serviceAccountName: sandbox-runner
+      # Same host as the Ray cluster. One-directional (runner -> head) so
+      # setup_sandbox.sh after deploy.sh apply cannot deadlock scheduling.
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                ray.io/cluster: ${CLUSTER_NAME}
+                ray.io/node-type: head
+            topologyKey: kubernetes.io/hostname
+      containers:
+      - name: sandbox-api
+        image: python:3.11-slim
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          apt-get update -qq && apt-get install -y -qq docker.io 2>&1 | tail -3
+          pip install --quiet --no-cache-dir fastapi uvicorn 2>&1 | tail -2
+          exec python3 /api/server.py
+        ports:
+        - containerPort: 8080
+        - containerPort: 18001
+          name: adapter-relay
+        env:
+        - name: DOCKER_HOST
+          value: "unix:///var/run/dind/docker.sock"
+        - name: ADAPTER_RELAY_HOST
+          value: "${CLUSTER_NAME}-head-svc.${NAMESPACE}.svc.cluster.local"
+        - name: ADAPTER_RELAY_PORT
+          value: "18001"
+        # Per-sandbox cgroup slice. dind's resources below are derived from these
+        # same values by deploy.sh, so the slices sum to the daemon's budget.
+        - name: SANDBOX_CPUS
+          value: "${SANDBOX_CPUS}"
+        - name: SANDBOX_MEMORY
+          value: "${SANDBOX_MEMORY}"
+        - name: SANDBOX_PIDS
+          value: "${SANDBOX_PIDS}"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 5
+          failureThreshold: 60
+        volumeMounts:
+        - name: api-script
+          mountPath: /api
+        - name: dind-socket
+          mountPath: /var/run/dind
+        - name: image-cache
+          mountPath: /image-cache
+        # Thin control plane: it shells out to the Docker CLI and pumps the
+        # adapter relay. The container budget belongs to dind, not here.
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "2"
+            memory: "2Gi"
+      - name: dind
+        image: docker:27-dind
+        command: ["/bin/sh", "-c"]
+        args: ["ulimit -u unlimited && exec dockerd-entrypoint.sh --default-ulimit nproc=-1:-1"]
+        securityContext:
+          privileged: true
+        env:
+        - name: DOCKER_TLS_CERTDIR
+          value: ""
+        volumeMounts:
+        - name: dind-socket
+          mountPath: /var/run
+        - name: dind-storage
+          mountPath: /var/lib/docker
+        resources:
+          requests:
+            cpu: "${DIND_CPU_REQUEST}"
+            memory: "${DIND_MEM_LIMIT}"
+          limits:
+            cpu: "${DIND_CPU_LIMIT}"
+            memory: "${DIND_MEM_LIMIT}"
+      volumes:
+      - name: dind-socket
+        emptyDir: {}
+      - name: dind-storage
+        emptyDir:
+          sizeLimit: "${DIND_STORAGE_LIMIT}"
+      - name: api-script
+        configMap:
+          name: sandbox-runner-api
+      - name: image-cache
+        persistentVolumeClaim:
+          claimName: ${IMAGES_PVC_NAME}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sandbox-runner-${RUNNER_INDEX}
+  namespace: ${NAMESPACE}
+spec:
+  selector:
+    app: sandbox-runner-${RUNNER_INDEX}
+  ports:
+  - port: 8080
+    targetPort: 8080

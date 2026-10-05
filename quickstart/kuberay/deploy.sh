@@ -13,7 +13,7 @@
 #   ./deploy.sh retriever | retriever-delete | render-retriever # searchr1 helper (verl)
 #
 # Options:
-#   --framework verl|vime|slime   which framework (default verl)
+#   --framework verl|vime|slime|slime-swe-agent  which framework (default verl)
 #   --engine vllm|sglang          which rollout engine, from that framework's columns
 #   --from-local [DIR]            provision the working tree instead of git main
 #
@@ -52,8 +52,12 @@ INTEGRATIONS="$REPO_ROOT/integrations"
 COMMON_CONFIGS="$INTEGRATIONS/common/src/llm_d_rl_common/configs"
 COMMON_SRC="$INTEGRATIONS/common/src"
 
-[[ -f "$INTEGRATIONS/$FRAMEWORK/environments.env" ]] || {
-  echo "ERROR: unknown framework '$FRAMEWORK' (no integrations/$FRAMEWORK/environments.env)" >&2; exit 2; }
+# Cluster shapes may share an integration (slime-swe-agent is slime + extra
+# provision/PVC). Environment image and git refs live with the integration.
+ENV_FRAMEWORK="$FRAMEWORK"
+[[ "$FRAMEWORK" == "slime-swe-agent" ]] && ENV_FRAMEWORK=slime
+[[ -f "$INTEGRATIONS/$ENV_FRAMEWORK/environments.env" ]] || {
+  echo "ERROR: unknown framework '$FRAMEWORK' (no integrations/$ENV_FRAMEWORK/environments.env)" >&2; exit 2; }
 
 # Sourced widest-to-narrowest, so a later file can override an earlier one:
 # routing stack -> framework/engine -> cluster shape -> this cluster.
@@ -64,7 +68,7 @@ IMG_EPP="${IMG_EPP:-$LLMD_EPP_IMAGE}"
 IMG_ENVOY="${IMG_ENVOY:-$LLMD_ENVOY_IMAGE}"
 IMG_SIDECAR="${IMG_SIDECAR:-$LLMD_SIDECAR_IMAGE}"
 # shellcheck disable=SC1091
-. "$INTEGRATIONS/$FRAMEWORK/environments.env"
+. "$INTEGRATIONS/$ENV_FRAMEWORK/environments.env"
 # shellcheck disable=SC1091
 . ./frameworks.env
 # shellcheck disable=SC1091
@@ -81,12 +85,12 @@ case "$ACTION" in
   *) case "${IMG_EPP:-}" in
        ""|*REPLACE*|*placeholder*|"<"*">")
          echo "ERROR: IMG_EPP is unset or a placeholder ('${IMG_EPP:-}')." >&2
-         echo "       Set it in integrations/$FRAMEWORK/environments.env." >&2
+         echo "       Set it in integrations/$ENV_FRAMEWORK/environments.env." >&2
          exit 2 ;;
      esac ;;
 esac
 
-fw() { local v="FW_${FRAMEWORK}_$1"; echo "${!v-}"; }
+fw() { local k="${FRAMEWORK//-/_}"; local v="FW_${k}_$1"; echo "${!v-}"; }
 
 # Resolve the framework's cluster shape and its engine column into the names the
 # templates use. Fails fast rather than rendering blank values into a manifest
@@ -102,7 +106,14 @@ resolve() {
   export WORKER_GPUS="$(fw WORKER_GPUS)"
   export HEAD_GPUS="$(fw HEAD_GPUS)"
   export PVC_NAME="${PVC_NAME:-$(fw PVC_NAME)}"
-  export CONFIGMAP_NAME="llmd-epp-configs-${FRAMEWORK}"
+  [[ -n "$PVC_NAME" ]] || { echo "ERROR: $FRAMEWORK declares no FW_${FRAMEWORK}_PVC_NAME" >&2; exit 2; }
+  export STORAGE_CLASS="${STORAGE_CLASS:-$(fw STORAGE_CLASS)}"
+  export PVC_SIZE="${PVC_SIZE:-$(fw PVC_SIZE)}"
+  export PVC_SIZE="${PVC_SIZE:-1Ti}"
+  export IMAGES_PVC_NAME="${IMAGES_PVC_NAME:-$(fw IMAGES_PVC_NAME)}"
+  export IMAGES_PVC_SIZE="${IMAGES_PVC_SIZE:-$(fw IMAGES_PVC_SIZE)}"
+  export IMAGES_PVC_SIZE="${IMAGES_PVC_SIZE:-$PVC_SIZE}"
+  export CONFIGMAP_NAME="llmd-epp-configs-${FRAMEWORK//_/-}"
 
   local engines; engines="$(fw ENGINES)"
   ENGINE="${ENGINE:-${engines%% *}}"
@@ -112,7 +123,7 @@ resolve() {
   local img="ENGINE_${ENGINE}_IMAGE" py="ENGINE_${ENGINE}_PY_MODULE"
   local cpus="ENGINE_${ENGINE}_HEAD_NUM_CPUS" alloc="ENGINE_${ENGINE}_ALLOC_CONF"
   [[ -n "${!img:-}" ]] || {
-    echo "ERROR: no ENGINE_${ENGINE}_IMAGE in integrations/$FRAMEWORK/environments.env" >&2; exit 2; }
+    echo "ERROR: no ENGINE_${ENGINE}_IMAGE in integrations/$ENV_FRAMEWORK/environments.env" >&2; exit 2; }
   export IMG_TRAINER="${!img}"
   export ENGINE_PY_MODULE="${!py:-$ENGINE}"
   export ENGINE_HEAD_NUM_CPUS="${!cpus:-0}"
@@ -134,8 +145,19 @@ render() {
 
 render_pvc() {
   resolve
-  [[ -n "$PVC_NAME" ]] || { echo "ERROR: $FRAMEWORK declares no FW_${FRAMEWORK}_PVC_NAME" >&2; exit 2; }
-  envsubst '${NAMESPACE} ${PVC_NAME}' < pvc.yaml
+  envsubst '${NAMESPACE} ${PVC_NAME} ${STORAGE_CLASS} ${PVC_SIZE}' < pvc.yaml
+  # Same template, second claim: only its name and size differ. Its own rationale
+  # replaces the template's header, which is about the checkpoint cache.
+  if [[ -n "$IMAGES_PVC_NAME" ]]; then
+    printf -- '---\n'
+    printf '# Disposable image-tarball cache for the sandbox-runner pods, kept off\n'
+    printf '# %s so it cannot fill the volume holding the checkpoints.\n' "$PVC_NAME"
+    printf '# `kubectl delete pvc %s -n %s` wipes it; the next prefetch repopulates.\n' \
+      "$IMAGES_PVC_NAME" "$NAMESPACE"
+    PVC_NAME="$IMAGES_PVC_NAME" PVC_SIZE="$IMAGES_PVC_SIZE" \
+      envsubst '${NAMESPACE} ${PVC_NAME} ${STORAGE_CLASS} ${PVC_SIZE}' < pvc.yaml \
+      | grep -v '^#'
+  fi
 }
 
 render_retriever() {
@@ -148,6 +170,7 @@ create_configmap() {
   # Every EPP variant this framework can use, merged from base.yaml + a profile +
   # modifiers (configs/epp/variants.yaml), then EPP_PARSER substituted. Adding a
   # variant is a line in variants.yaml; this function does not change.
+  export EPP_PARSER="${EPP_PARSER:-$(fw EPP_PARSER 2>/dev/null || true)}"
   export EPP_PARSER="${EPP_PARSER:-$LLMD_EPP_PARSER_DEFAULT}"
   local dir; dir="$(mktemp -d)"
   # Expanded now, not at return: a RETURN trap fires after `local dir` is out of
@@ -171,6 +194,7 @@ create_configmap() {
   args+=(--from-file="envoy.yaml=$COMMON_CONFIGS/$(fw ENVOY_CONFIG)")
   # Workload config a framework's own driver needs on the pod.
   local extra="../benchmarks/$FRAMEWORK/configmap-files.txt"
+  [[ -f "$extra" ]] || extra="../benchmarks/${FRAMEWORK%%-*}/configmap-files.txt"
   if [[ -f "$extra" ]]; then
     while read -r line; do
       [[ -z "$line" || "$line" == \#* ]] && continue
@@ -199,7 +223,8 @@ pods_of_role() {
 exec_retry() {
   local pod="$1"; shift
   local n=0
-  until K exec -n "$NAMESPACE" -i -c "$(container_for "$pod")" "$pod" -- "$@"; do
+  local to="${KUBECTL_PROVISION_TIMEOUT:-900}"
+  until timeout "$to" kubectl exec -n "$NAMESPACE" -c "$(container_for "$pod")" "$pod" -- "$@" </dev/null; do
     n=$((n+1)); [[ $n -ge 3 ]] && { echo "ERROR: exec failed 3x on $pod" >&2; return 1; }
     echo "  retrying on $pod ($n/3)" >&2; sleep 5
   done
@@ -302,8 +327,17 @@ PY
 case "$ACTION" in
   render)            render ;;
   configmap)         create_configmap ;;
-  apply)             create_configmap; render | kubectl apply -f - ;;
-  delete)            render | kubectl delete --ignore-not-found -f - ;;
+  apply)
+    create_configmap; render | kubectl apply -f -
+    ;;
+  delete)
+    render | kubectl delete --ignore-not-found -f -
+    if [[ "$FRAMEWORK" == "slime-swe-agent" ]]; then
+      kubectl get deployment,service -n "$NAMESPACE" -o name 2>/dev/null \
+        | grep "/sandbox-runner-" \
+        | xargs -r kubectl delete -n "$NAMESPACE" --ignore-not-found
+    fi
+    ;;
   provision)         provision ;;
   check)             check ;;
   pvc)               render_pvc | kubectl apply -f - ;;
